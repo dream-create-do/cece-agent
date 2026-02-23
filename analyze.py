@@ -528,10 +528,73 @@ def extract_rubrics(data):
     return rubrics
 
 
+def _classify_obj_type(source_label, text):
+    """
+    Determine whether an objective is a CLO or MLO based on source and phrasing.
+    Returns: 'CLO' | 'MLO' | 'unknown'
+    """
+    src = source_label.lower()
+    txt = text.lower()
+
+    # Explicit label overrides everything
+    if re.search(r'\bclo[-\s]?\d*\b|course.level.objective|course.learning.objective', txt + ' ' + src):
+        return 'CLO'
+    if re.search(r'\bmlo[-\s]?\d*\b|module.level.objective|module.learning.objective|module.objective', txt + ' ' + src):
+        return 'MLO'
+
+    # Syllabus is almost always CLOs
+    if src == '[syllabus]':
+        return 'CLO'
+
+    # "by the end of this course" → CLO
+    if re.search(r'by\s+the\s+end\s+of\s+(?:this\s+)?(?:the\s+)?course', txt):
+        return 'CLO'
+
+    # "by the end of this module/week/unit" → MLO
+    if re.search(r'by\s+the\s+end\s+of\s+(?:this\s+)?(?:module|week|unit|lesson)', txt):
+        return 'MLO'
+
+    # Course-level page names → CLO
+    CLO_PAGE_KEYS = ['syllabus', 'course-info', 'course-overview', 'welcome',
+                     'introduction', 'getting-started', 'start-here',
+                     'outcomes', 'goals', 'course-objectives']
+    if any(k in src for k in CLO_PAGE_KEYS):
+        return 'CLO'
+
+    # Module/week page names or assignment instructions → MLO
+    if re.search(r'module[-\s]?\d|week[-\s]?\d|unit[-\s]?\d|\bmod[-\s]?\d', src):
+        return 'MLO'
+    if src.startswith('[assignment]'):
+        return 'MLO'
+
+    return 'unknown'
+
+
+def _module_number_from_source(source_label, modules):
+    """
+    Try to infer which module number an MLO belongs to from its source page name.
+    Returns int module number or None.
+    """
+    src = source_label.lower()
+
+    # Try direct match: "module-3", "week-3", "mod3"
+    m = re.search(r'(?:module|week|unit|mod)[-\s]?(\d+)', src)
+    if m:
+        return int(m.group(1))
+
+    # Try matching module title words
+    for mod in modules:
+        mod_words = [w for w in re.split(r'[\s|]+', mod['title'].lower()) if len(w) > 3]
+        if any(w in src for w in mod_words):
+            return mod.get('number') or mod.get('position')
+
+    return None
+
+
 def _extract_objectives_from_text(text, source_label, found_norms=None):
     """
     Extract objective statements from a single block of text.
-    Returns list of dicts: {text, blooms, source, location}
+    Returns list of dicts: {text, blooms, source, obj_type, module_num}
     found_norms: set of already-seen normalized texts (for deduplication across calls)
     """
     if found_norms is None:
@@ -557,7 +620,7 @@ def _extract_objectives_from_text(text, source_label, found_norms=None):
     ]
 
     SECTION_RE = re.compile(
-        r'(?:course\s+)?(?:learning\s+)?objectives?\s*:?[ \t]*\n((?:[^\n]+\n){1,30})',
+        r'(?:course\s+)?(?:module\s+)?(?:learning\s+)?objectives?\s*:?[ \t]*\n((?:[^\n]+\n){1,30})',
         re.IGNORECASE
     )
 
@@ -571,17 +634,35 @@ def _extract_objectives_from_text(text, source_label, found_norms=None):
         if norm not in found_norms:
             found_norms.add(norm)
             results.append({
-                'text':   clean[:200],
-                'blooms': detect_blooms_level(clean),
-                'source': source_label,
+                'text':       clean[:200],
+                'blooms':     detect_blooms_level(clean),
+                'source':     source_label,
+                'obj_type':   _classify_obj_type(source_label, clean),
             })
 
-    # 1. Objective section blocks
+    # 1. Objective section blocks — check header to help with classification
     for sec in SECTION_RE.finditer(text):
+        header = sec.group(0).split('\n')[0].lower()
+        # If the section header says "module" → all lines are MLOs
+        # If the section header says "course" → all lines are CLOs
+        section_hint = ('MLO' if 'module' in header
+                        else 'CLO' if 'course' in header
+                        else None)
         for line in sec.group(1).splitlines():
             line = re.sub(r'^[\s\d.)\-\u2022*]+', '', line).strip()
-            if detect_blooms_level(line) != 'Unclear':
-                _add(line)
+            if len(line) < 20:
+                continue
+            norm = re.sub(r'\s+', ' ', line.lower())
+            if norm not in found_norms:
+                if detect_blooms_level(line) != 'Unclear' or section_hint:
+                    found_norms.add(norm)
+                    obj_type = section_hint or _classify_obj_type(source_label, line)
+                    results.append({
+                        'text':     line[:200],
+                        'blooms':   detect_blooms_level(line),
+                        'source':   source_label,
+                        'obj_type': obj_type,
+                    })
 
     # 2. Regex patterns across full text
     for pattern in PATTERNS:
@@ -607,27 +688,20 @@ def _fuzzy_match(text_a, text_b, threshold=0.55):
     wa, wb = words(text_a), words(text_b)
     if not wa or not wb:
         return False
-    overlap = len(wa & wb)
-    return overlap / min(len(wa), len(wb)) >= threshold
+    return len(wa & wb) / min(len(wa), len(wb)) >= threshold
 
 
 def extract_learning_objectives(data, modules):
     """
-    Two-corpus objective extraction:
-      1. Course corpus  (ALL published wiki pages + ALL assignment instructions) → authority
-      2. Syllabus corpus (user-provided syllabus text) → checked against course
+    Extract CLOs and MLOs from the COURSE ONLY.
+    Sources: all published wiki pages + all published assignment instructions.
+    The syllabus is NOT used here — see extract_syllabus_objectives() for that.
 
-    Returns a list of objective dicts, each with:
-      text, blooms, source, location ('course' | 'syllabus' | 'both')
-
-    Course-only objectives are flagged: present in course but missing from syllabus.
-    Syllabus-only objectives are flagged: stated in syllabus but not found in course.
+    Returns list of dicts:
+      text, blooms, source, obj_type ('CLO'|'MLO'|'unknown'), module_num (int|None)
     """
-    course_norms = set()   # dedup within course corpus
-    syl_norms    = set()   # dedup within syllabus corpus
+    course_norms = set()
 
-    # ── 1. Extract from course corpus ────────────────────────────────
-    # Sort pages so objective/overview/module pages come first
     PRIORITY_KEYS = ['objective','overview','welcome','introduction','getting-started',
                      'start-here','outcomes','goals','competenc','module','week','unit']
 
@@ -642,52 +716,104 @@ def extract_learning_objectives(data, modules):
                         key=lambda x: page_priority(x[0]))
 
     course_objectives = []
+
+    # All published wiki pages
     for page_name, content in wiki_pages:
         if content and len(content.strip()) > 80:
             found = _extract_objectives_from_text(content, page_name, course_norms)
+            for obj in found:
+                obj['module_num'] = _module_number_from_source(page_name, modules)
             course_objectives.extend(found)
 
-    # Also scan every published assignment's instructions
+    # All published assignment instructions
     for assign_name, det in data.get('assignments', {}).items():
         instructions = det.get('instructions', '').strip()
         if instructions and len(instructions) > 80:
             label = f'[Assignment] {assign_name}'
             found = _extract_objectives_from_text(instructions, label, course_norms)
+            for obj in found:
+                obj['module_num'] = _module_number_from_source(
+                    det.get('folder_id', ''), modules
+                )
             course_objectives.extend(found)
-
-    # ── 2. Extract from syllabus ──────────────────────────────────────
-    syl_text = data.get('syllabus_text', '').strip()
-    syllabus_objectives = []
-    if syl_text:
-        syllabus_objectives = _extract_objectives_from_text(syl_text, '[Syllabus]', syl_norms)
-
-    # ── 3. Cross-reference ────────────────────────────────────────────
-    # For each course objective: does it appear in the syllabus?
-    for obj in course_objectives:
-        matched = any(_fuzzy_match(obj['text'], s['text']) for s in syllabus_objectives)
-        obj['location'] = 'both' if matched else 'course_only'
-
-    # For each syllabus objective: does it appear in the course?
-    syllabus_only = []
-    for syl_obj in syllabus_objectives:
-        matched = any(_fuzzy_match(syl_obj['text'], c['text']) for c in course_objectives)
-        if not matched:
-            syl_obj['location'] = 'syllabus_only'
-            syllabus_only.append(syl_obj)
-
-    # ── 4. Combine: course objectives first, then unmatched syllabus ones
-    all_objectives = course_objectives + syllabus_only
 
     # Deduplicate near-matches by first 60 chars
     seen_prefixes = set()
     deduped = []
-    for obj in all_objectives:
+    for obj in course_objectives:
         prefix = obj['text'][:60].lower().strip()
         if prefix not in seen_prefixes:
             seen_prefixes.add(prefix)
             deduped.append(obj)
 
     return deduped[:60]
+
+
+def extract_syllabus_objectives(data):
+    """
+    Extract objectives from the user-provided syllabus ONLY.
+    Returns list of dicts: text, blooms, source, obj_type, module_num
+    Returns empty list if no syllabus provided.
+    """
+    syl_text = data.get('syllabus_text', '').strip()
+    if not syl_text:
+        return []
+
+    syl_norms = set()
+    found = _extract_objectives_from_text(syl_text, '[Syllabus]', syl_norms)
+    for obj in found:
+        obj['module_num'] = None
+
+    # Deduplicate
+    seen = set()
+    deduped = []
+    for obj in found:
+        prefix = obj['text'][:60].lower().strip()
+        if prefix not in seen:
+            seen.add(prefix)
+            deduped.append(obj)
+
+    return deduped[:40]
+
+
+def compare_objectives(course_objectives, syllabus_objectives):
+    """
+    Cross-reference course objectives against syllabus objectives.
+    Course is the authority — this comparison is for QM review only.
+
+    Returns a dict:
+      matched       — list of {course_obj, syl_obj} pairs that correspond
+      course_only   — course objectives with no syllabus counterpart
+      syllabus_only — syllabus objectives not reflected anywhere in the course
+    """
+    matched      = []
+    course_only  = []
+    used_syl_idx = set()
+
+    for c_obj in course_objectives:
+        best_match = None
+        best_idx   = None
+        for i, s_obj in enumerate(syllabus_objectives):
+            if i in used_syl_idx:
+                continue
+            if _fuzzy_match(c_obj['text'], s_obj['text']):
+                best_match = s_obj
+                best_idx   = i
+                break
+        if best_match:
+            used_syl_idx.add(best_idx)
+            matched.append({'course_obj': c_obj, 'syl_obj': best_match})
+        else:
+            course_only.append(c_obj)
+
+    syllabus_only = [s for i, s in enumerate(syllabus_objectives)
+                     if i not in used_syl_idx]
+
+    return {
+        'matched':      matched,
+        'course_only':  course_only,
+        'syllabus_only': syllabus_only,
+    }
 
 
 def run_qm_precheck(data, modules, grading_groups, objectives):
@@ -864,7 +990,8 @@ def calculate_health_score(qm_results):
 
 def build_analysis_document(data, identity, modules, grading_groups,
                              objectives, qm_results, udl_results,
-                             rubrics, qm_counts):
+                             rubrics, qm_counts,
+                             syl_objectives=None, comparison=None):
     met, partial, not_met, review_ct, recommendation = qm_counts
     today = datetime.now().strftime('%Y-%m-%d %H:%M')
     stats = data.get('publish_stats', {})
@@ -972,50 +1099,76 @@ def build_analysis_document(data, identity, modules, grading_groups,
         ]
     L += ['', '---']
 
-    # ── Section 5: Learning Objectives ──
+    # ── Section 5: Learning Objectives (Course) ──
     L += [
-        '', '## SECTION 5: LEARNING OBJECTIVES DETECTED',
-        '> **Course is the authority.** Objectives are extracted from all published pages and',
-        '> assignment instructions, then checked against the syllabus.',
-        '> ✅ both = found in course AND syllabus | ⚠️ course_only = in course, missing from syllabus',
-        '> ❌ syllabus_only = stated in syllabus, not found anywhere in the course', '',
+        '', '## SECTION 5: LEARNING OBJECTIVES (COURSE)',
+        '> Extracted from all published wiki pages and assignment instructions.',
+        '> The course is the authority. See Section 5C for comparison against the syllabus.',
+        '',
     ]
     if objectives:
-        course_only   = [o for o in objectives if o.get('location') == 'course_only']
-        syllabus_only = [o for o in objectives if o.get('location') == 'syllabus_only']
-        matched       = [o for o in objectives if o.get('location') == 'both']
+        clos     = [o for o in objectives if o.get('obj_type') == 'CLO']
+        mlos     = [o for o in objectives if o.get('obj_type') == 'MLO']
+        unknowns = [o for o in objectives if o.get('obj_type') == 'unknown']
 
-        # Summary line
-        L.append(f'**Summary:** {len(matched)} matched ✅ | '
-                 f'{len(course_only)} in course only ⚠️ | '
-                 f'{len(syllabus_only)} in syllabus only ❌')
+        L.append(f'**{len(clos)} CLOs | {len(mlos)} MLOs | {len(unknowns)} unclassified**')
         L.append('')
 
-        if course_only or syllabus_only:
-            L += [
-                '> ⚠️ **ALIGNMENT GAP DETECTED** — The objectives in the course and syllabus do not fully match.',
-                '> MeMe must reconcile these with the instructor before building the Blueprint.',
-                '',
-            ]
+        # ── CLO Table ──
+        L += ['### Course-Level Objectives (CLOs)', '']
+        if clos:
+            L += ["| # | Bloom's | Source | Objective |",
+                  '|---|---------|--------|-----------|']
+            for i, obj in enumerate(clos, 1):
+                L.append(
+                    f'| CLO-{i} | {obj["blooms"]} | {obj["source"][:35].replace("|","-")} '
+                    f'| {obj["text"][:130].replace("|","-")} |'
+                )
+        else:
+            L.append('*No CLOs detected in the course. MeMe must ask the instructor to provide them.*')
+        L.append('')
 
-        L += ['| # | Location | Source | Objective | Bloom\'s |',
-              '|---|----------|--------|-----------|---------|']
-        for i, obj in enumerate(objectives, 1):
-            loc = obj.get('location', 'course_only')
-            icon = '✅' if loc == 'both' else ('⚠️' if loc == 'course_only' else '❌')
-            L.append(
-                f'| {i} | {icon} {loc} | {obj["source"][:35].replace("|","-")} '
-                f'| {obj["text"][:130].replace("|","-")} | {obj["blooms"]} |'
-            )
+        # ── MLO Table grouped by module ──
+        L += ['### Module-Level Objectives (MLOs)', '']
+        if mlos:
+            module_groups = {}
+            for obj in mlos:
+                module_groups.setdefault(obj.get('module_num'), []).append(obj)
+            for mod_num in sorted(module_groups.keys(), key=lambda x: (x is None, x)):
+                label = f'Module {mod_num}' if mod_num else 'Module — number not detected'
+                L.append(f'**{label}**')
+                L += ["| # | Bloom's | Source | Objective |",
+                      '|---|---------|--------|-----------|']
+                for i, obj in enumerate(module_groups[mod_num], 1):
+                    L.append(
+                        f'| MLO-{mod_num or "?"}.{i} | {obj["blooms"]} '
+                        f'| {obj["source"][:30].replace("|","-")} '
+                        f'| {obj["text"][:130].replace("|","-")} |'
+                    )
+                L.append('')
+        else:
+            L.append('*No MLOs detected in the course. MeMe must ask the instructor to add module-level objectives.*')
+        L.append('')
+
+        if unknowns:
+            L += ['### Unclassified (MeMe to assign as CLO or MLO)', '']
+            L += ["| # | Bloom's | Source | Objective |",
+                  '|---|---------|--------|-----------|']
+            for i, obj in enumerate(unknowns, 1):
+                L.append(
+                    f'| {i} | {obj["blooms"]} | {obj["source"][:35].replace("|","-")} '
+                    f'| {obj["text"][:130].replace("|","-")} |'
+                )
+            L.append('')
     else:
-        L.append('*No objectives auto-detected. MeMe must ask the instructor to provide them.*')
+        L.append('*No objectives auto-detected in the course. MeMe must ask the instructor to provide them.*')
     L += ['', '---']
 
     # ── Section 5B: Alignment Matrix ──
     L += [
         '', '## SECTION 5B: ALIGNMENT MATRIX',
         '> Maps Course Learning Objectives → Module Learning Objectives → Assignments.',
-        '> Built from course content (the authority). Syllabus mismatches noted in Section 5.',
+        '> Built from course content (the authority). Syllabus comparison in Section 5C.',
         '> ⚠️ Auto-generated — MeMe must verify chains and fill gaps during consultation.', '',
     ]
 
@@ -1033,22 +1186,24 @@ def build_analysis_document(data, identity, modules, grading_groups,
     assign_details = data.get('assignments', {})
 
     if objectives:
-        clo_list = [o for o in objectives if o.get('source', '').lower() not in
-                    ('', 'none') and len(o['text']) > 20]
+        # Use CLO-typed objectives for the alignment matrix
+        clo_list = [o for o in objectives if o.get('obj_type') == 'CLO']
+        # Fall back to unknowns if classifier found nothing typed as CLO
+        if not clo_list:
+            clo_list = [o for o in objectives if o.get('obj_type') in ('CLO', 'unknown')]
 
         if clo_list:
             L += [
                 '### Course-Level Objectives (CLOs)',
-                "| CLO # | Objective | Bloom's Level | Source |",
-                '|-------|-----------|--------------|--------|',
+                "| CLO # | Objective | Bloom's Level |",
+                '|-------|-----------|--------------|',
             ]
             for i, obj in enumerate(clo_list, 1):
                 L.append(
                     f'| CLO-{i} | {obj["text"][:120].replace("|","-")} '
-                    f'| {obj["blooms"]} | {obj["source"][:40]} |'
+                    f'| {obj["blooms"]} |'
                 )
             L += ['', '---', '']
-
         # Module-level alignment table
         L += [
             '### Module Alignment Overview',
@@ -1118,6 +1273,120 @@ def build_analysis_document(data, identity, modules, grading_groups,
         for mod in modules:
             assigns_in_mod = mod_assign_map.get(mod['title'], [])
             L.append(f'| {mod["title"][:50]} | {len(assigns_in_mod)} |')
+
+    L += ['', '---']
+
+    # ── Section 5C: Course vs Syllabus Objective Comparison ──
+    L += [
+        '', '## SECTION 5C: COURSE vs SYLLABUS OBJECTIVE COMPARISON',
+        '> Compares objectives found in the course against the provided syllabus.',
+        '> This section is for QM review only — it does not change the course objectives.',
+        '> ✅ Matched = same objective found in both | ⚠️ Course only = in course, not in syllabus',
+        '> ❌ Syllabus only = stated in syllabus, no matching content found in course', '',
+    ]
+
+    if syl_objectives is None:
+        syl_objectives = []
+    if comparison is None:
+        comparison = {'matched': [], 'course_only': [], 'syllabus_only': []}
+
+    if not syl_objectives:
+        L += [
+            '> ℹ️ No syllabus was provided — comparison not possible.',
+            '> MeMe should request the syllabus and verify objective alignment manually.',
+        ]
+    else:
+        matched_list  = comparison.get('matched', [])
+        c_only_list   = comparison.get('course_only', [])
+        s_only_list   = comparison.get('syllabus_only', [])
+        total_course  = len(matched_list) + len(c_only_list)
+        total_syl     = len(matched_list) + len(s_only_list)
+
+        L.append(
+            f'**{len(matched_list)} matched ✅ | '
+            f'{len(c_only_list)} course-only ⚠️ | '
+            f'{len(s_only_list)} syllabus-only ❌ | '
+            f'{total_course} total course objectives | '
+            f'{total_syl} total syllabus objectives**'
+        )
+        L.append('')
+
+        has_gap = c_only_list or s_only_list
+        if has_gap:
+            L += [
+                '> ⚠️ **MISMATCH DETECTED** — The course and syllabus do not fully agree on objectives.',
+                '> MeMe must reconcile this with the instructor. Key QM standards affected: GS 2.1, GS 2.2, GS 2.4.',
+                '',
+            ]
+        else:
+            L += [
+                '> ✅ All course objectives have a corresponding entry in the syllabus.',
+                '',
+            ]
+
+        # Matched
+        if matched_list:
+            L += ['### ✅ Matched — In Course and Syllabus', '']
+            L += ["| Course Objective | Syllabus Version | Bloom's |",
+                  "|-----------------|-----------------|---------|"]
+            for pair in matched_list:
+                c = pair['course_obj']
+                s = pair['syl_obj']
+                L.append(
+                    f'| {c["text"][:90].replace("|","-")} '
+                    f'| {s["text"][:90].replace("|","-")} '
+                    f'| {c["blooms"]} |'
+                )
+            L.append('')
+
+        # Course only
+        if c_only_list:
+            L += ['### ⚠️ Course Only — Present in Course, Missing from Syllabus', '']
+            L += ["| Objective | Bloom's | Source |",
+                  "|-----------|---------|--------|"]
+            for obj in c_only_list:
+                L.append(
+                    f'| {obj["text"][:110].replace("|","-")} '
+                    f'| {obj["blooms"]} '
+                    f'| {obj["source"][:35].replace("|","-")} |'
+                )
+            L += ['', '> These objectives exist in the course but are not stated in the syllabus.',
+                  '> The syllabus should be updated to reflect them (GS 2.1).', '']
+
+        # Syllabus only
+        if s_only_list:
+            L += ['### ❌ Syllabus Only — Stated in Syllabus, Not Found in Course', '']
+            L += ["| Objective | Bloom's |",
+                  "|-----------|---------|"]
+            for obj in s_only_list:
+                L.append(
+                    f'| {obj["text"][:120].replace("|","-")} '
+                    f'| {obj["blooms"]} |'
+                )
+            L += ['', '> These objectives appear in the syllabus but CeCe found no corresponding',
+                  '> content, activities, or assessments in the course.',
+                  '> Either the course content is missing, or the syllabus is out of date (GS 2.1, GS 2.4).', '']
+
+        # QM Standards requiring syllabus review
+        L += [
+            '### QM Standards That Require Syllabus Review',
+            '> The following standards cannot be fully evaluated from the course export alone.',
+            '> MeMe must review the syllabus for each of these during consultation.',
+            '',
+            '| Standard | What to Check in Syllabus |',
+            '|----------|--------------------------|',
+            '| GS 1.2 | Course description and purpose clearly stated |',
+            '| GS 1.3 | Communication expectations and instructor response time |',
+            '| GS 1.4 | Late work policy, academic integrity, course policies |',
+            '| GS 1.5 | Technology requirements listed |',
+            "| GS 2.1 | CLOs present, measurable, and use Bloom's verbs |",
+            '| GS 2.4 | Alignment statements connecting activities to CLOs |',
+            '| GS 3.2 | Grading criteria clearly explained |',
+            '| GS 7.1 | Technical support resources listed |',
+            '| GS 7.2 | Accessibility/disability statement present |',
+            '| GS 7.3 | Student support services listed |',
+        ]
+        L.append('')
 
     L += ['', '---']
 
@@ -1401,6 +1670,8 @@ def main():
     grading_groups = extract_grading_structure(data)
     rubrics        = extract_rubrics(data)
     objectives     = extract_learning_objectives(data, modules)
+    syl_objectives = extract_syllabus_objectives(data)
+    comparison     = compare_objectives(objectives, syl_objectives)
     stats          = data['publish_stats']
 
     print(f'   Course:      {identity["title"]} — {identity["code"]}')
@@ -1410,7 +1681,13 @@ def main():
         wk = ', '.join(mod["weeks_in_module"]) if mod["weeks_in_module"] else 'no week labels'
         print(f'              Module {mod["position"]}: {mod["title"][:50]} [{wk}]')
     print(f'   Grading:     {len(grading_groups)} groups')
-    print(f'   Objectives:  {len(objectives)} detected')
+    print(f'   Objectives:  {len(objectives)} in course '
+          f'({len([o for o in objectives if o["obj_type"]=="CLO"])} CLOs, '
+          f'{len([o for o in objectives if o["obj_type"]=="MLO"])} MLOs)')
+    print(f'   Syllabus:    {len(syl_objectives)} objectives extracted | '
+          f'{len(comparison["matched"])} matched | '
+          f'{len(comparison["course_only"])} course-only | '
+          f'{len(comparison["syllabus_only"])} syllabus-only')
     print(f'   Rubrics:     {len(rubrics)}')
     print(f'   Assignments: {stats.get("assign_published",0)} published | '
           f'{stats.get("assign_unpublished",0)} unpublished (skipped)')
@@ -1439,7 +1716,8 @@ def main():
     print('\n📝 Building Analysis Document...')
     document = build_analysis_document(
         data, identity, modules, grading_groups,
-        objectives, qm_results, udl_results, rubrics, qm_counts
+        objectives, qm_results, udl_results, rubrics, qm_counts,
+        syl_objectives=syl_objectives, comparison=comparison
     )
 
     with open(output_path, 'w', encoding='utf-8') as f:
