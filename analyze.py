@@ -92,77 +92,6 @@ def detect_blooms_level(text):
     return max(found, key=lambda l: level_order.index(l)) if found else 'Unclear'
 
 
-def detect_iframe_syllabus(raw_html):
-    """
-    Checks if a syllabus file is just an iframe/embed rather than readable text.
-    Returns (is_embed, all_external_links, plain_text)
-    """
-    srcs  = re.findall(r'src=["\']([^"\']+)["\']', raw_html)
-    hrefs = re.findall(r'href=["\']([^"\']+)["\']', raw_html)
-    text  = strip_html(raw_html)
-    external = [u for u in srcs + hrefs
-                if u.startswith('http') and 'canvas' not in u.lower() and u != '#']
-    is_embed = len(text) < 150
-    return is_embed, external, text
-
-
-def detect_lti_syllabus(course_settings_xml, lti_files, all_files, zip_handle):
-    """
-    Checks if the syllabus is delivered via an LTI tool (e.g. Simple Syllabus,
-    Concourse, etc.) by inspecting the Canvas tab configuration and LTI resource links.
-    Returns (found, tool_name, description)
-    """
-    # Known LTI syllabus tool identifiers and display names
-    SYLLABUS_TOOLS = [
-        ('simplesyllabus',  'Simple Syllabus'),
-        ('simple_syllabus', 'Simple Syllabus'),
-        ('concourse',       'Concourse Syllabus'),
-        ('syllabi',         'Syllabi'),
-        ('coursetool',      'Course Tool Syllabus'),
-    ]
-
-    # Check tab configuration in course_settings.xml for external tool names
-    tab_config = re.search(r'<tab_configuration>(\[.*?\])</tab_configuration>',
-                           course_settings_xml, re.DOTALL)
-    if tab_config:
-        config_str = tab_config.group(1).lower()
-        for key, name in SYLLABUS_TOOLS:
-            if key in config_str:
-                return True, name, f'Detected as Canvas navigation tab via LTI'
-
-    # Check lti_resource_links files for syllabus-related tool names
-    for lti_path in lti_files:
-        try:
-            raw = zip_handle.read(lti_path).decode('utf-8', errors='ignore').lower()
-            for key, name in SYLLABUS_TOOLS:
-                if key in raw:
-                    return True, name, f'Detected in LTI resource link: {lti_path}'
-            # Also check for generic "syllabus" in LTI tool title
-            title_m = re.search(r'<title>([^<]*syllabus[^<]*)</title>', raw, re.IGNORECASE)
-            if title_m:
-                tool_name = strip_html(title_m.group(1)).strip().title()
-                return True, tool_name, f'Detected in LTI resource link: {lti_path}'
-        except Exception:
-            pass
-
-    # Check context.xml for external tool references
-    if 'course_settings/context.xml' in all_files:
-        try:
-            raw = zip_handle.read('course_settings/context.xml').decode('utf-8', errors='ignore').lower()
-            for key, name in SYLLABUS_TOOLS:
-                if key in raw:
-                    return True, name, 'Detected in context.xml'
-        except Exception:
-            pass
-
-    return False, None, None
-    srcs  = re.findall(r'src=["\']([^"\']+)["\']', raw_html)
-    hrefs = re.findall(r'href=["\']([^"\']+)["\']', raw_html)
-    text  = strip_html(raw_html)
-    external = [u for u in srcs + hrefs
-                if u.startswith('http') and 'canvas' not in u.lower() and u != '#']
-    return len(text) < 150, external, text
-
 
 def clean_assignment_name(folder_id, file_name):
     name = file_name.replace('.html','').replace('-|-',' | ').replace('-',' ')
@@ -237,11 +166,12 @@ def build_published_file_set(module_meta_xml, manifest_xml):
 #  IMSCC READER
 # ─────────────────────────────────────────────────────────────
 
-def read_imscc(file_path, file_bytes=None):
+def read_imscc(file_path, file_bytes=None, syllabus_text=''):
     """
     Accepts either:
-      file_path: str  — path to a .imscc file on disk (GUI / CLI mode)
+      file_path: str    — path to a .imscc file on disk (GUI / CLI mode)
       file_bytes: bytes — in-memory content (Streamlit upload mode)
+      syllabus_text: str — full syllabus text provided directly by the user
     When file_bytes is provided, file_path is used only for display.
     """
     import io
@@ -252,12 +182,7 @@ def read_imscc(file_path, file_bytes=None):
     data = {
         'file_name':          display_name,
         'all_files':          [],
-        'syllabus_raw':        '',
-        'syllabus_text':       '',
-        'syllabus_is_embed':   False,
-        'syllabus_links':      [],
-        'syllabus_source':     'canvas_tab',
-        'syllabus_lti_tool':   None,    # name of LTI tool if syllabus is LTI-delivered
+        'syllabus_text':       '',   # provided directly by the user, not scraped
         'course_settings':    '',
         'assignment_groups':  '',
         'module_meta':        '',
@@ -289,68 +214,14 @@ def read_imscc(file_path, file_bytes=None):
             if path in files:
                 data[key] = z.read(path).decode('utf-8', errors='ignore')
 
-        # ── Syllabus ──
-        # Step 1: Check the Canvas syllabus tab file
-        if 'course_settings/syllabus.html' in files:
-            raw = z.read('course_settings/syllabus.html').decode('utf-8', errors='ignore')
-            data['syllabus_raw'] = raw
-            is_embed, links, text = detect_iframe_syllabus(raw)
-            data['syllabus_is_embed'] = is_embed
-            data['syllabus_links']    = links
-            data['syllabus_text']     = text
 
-        # Step 2: If Canvas tab is empty or just an embed, look for syllabus wiki pages.
-        # Instructors often build the syllabus as a standalone wiki page instead of
-        # using the Canvas syllabus tab. These pages may not live inside any module.
-        # We search for them explicitly regardless of publish state since a syllabus
-        # is always student-facing by nature.
-        syllabus_tab_is_empty = len(data['syllabus_text'].strip()) < 50
+        # ── Syllabus is provided directly by the user ──
+        if syllabus_text:
+            data['syllabus_text'] = syllabus_text.strip()
+            print(f'   Syllabus: {len(syllabus_text):,} chars provided by user')
+        else:
+            print('   Syllabus: not provided — will be requested by MeMe')
 
-        if syllabus_tab_is_empty:
-            syllabus_wiki_candidates = [
-                f for f in files
-                if f.startswith('wiki_content/')
-                and f.endswith('.html')
-                and 'syllabus' in f.lower()
-            ]
-            # Also check for common standalone syllabus page names
-            syllabus_name_patterns = ['syllabus', 'course-information',
-                                      'course-policies', 'course-overview']
-            for f in files:
-                if (f.startswith('wiki_content/') and f.endswith('.html')
-                        and f not in syllabus_wiki_candidates
-                        and any(p in f.lower() for p in syllabus_name_patterns)):
-                    syllabus_wiki_candidates.append(f)
-
-            if syllabus_wiki_candidates:
-                combined_syllabus = []
-                for page_path in syllabus_wiki_candidates:
-                    try:
-                        raw   = z.read(page_path).decode('utf-8', errors='ignore')
-                        clean = strip_html(raw).strip()
-                        if len(clean) > 100:  # ignore near-empty pages
-                            page_name = page_path.replace('wiki_content/','').replace('.html','')
-                            combined_syllabus.append(f"[Source: {page_name}]\n{clean}")
-                            print(f"   Syllabus wiki page found: {page_path}")
-                    except Exception:
-                        pass
-
-                if combined_syllabus:
-                    data['syllabus_text']     = '\n\n'.join(combined_syllabus)
-                    data['syllabus_is_embed'] = False
-                    data['syllabus_source']   = 'wiki_page'
-
-        # ── LTI tools ──
-        data['lti_tools'] = [f for f in files if f.startswith('lti_resource_links/')]
-
-        # ── Check for LTI-delivered syllabus BEFORE reading the Canvas tab ──
-        lti_syllabus_found, lti_tool_name, lti_description = detect_lti_syllabus(
-            data['course_settings'], data['lti_tools'], files, z
-        )
-        if lti_syllabus_found:
-            data['syllabus_lti_tool'] = lti_tool_name
-            data['syllabus_source']   = 'lti_tool'
-            print(f"   Syllabus: LTI tool detected — {lti_tool_name}")
 
         # ── Build published file set from module metadata + manifest ──
         published_hrefs, item_states, id_to_href = build_published_file_set(
@@ -874,38 +745,16 @@ def build_analysis_document(data, identity, modules, grading_groups,
     stats = data.get('publish_stats', {})
     L = []
 
-    # ── Determine syllabus situation for banner ──
-    syl_lti     = data.get('syllabus_lti_tool')
-    syl_embed   = data.get('syllabus_is_embed')
-    syl_wiki    = data.get('syllabus_source') == 'wiki_page'
-    syl_text    = data.get('syllabus_text', '').strip()
-    syl_missing = not syl_text and not syl_lti and not syl_embed
+    # ── Syllabus status for banner ──
+    syl_text = data.get('syllabus_text', '').strip()
 
-    if syl_lti:
-        syl_banner = (
-            '> ⚠️ **ACTION REQUIRED BEFORE CONSULTING:** The syllabus is in '
-            f'**{syl_lti}** (an external LTI tool) and could not be read. '
-            'Please paste your full syllabus into **Section 14** of this document '
-            'before sending to the GPT. Accurate GS1, GS2, and alignment analysis require it.'
-        )
-    elif syl_embed:
-        syl_banner = (
-            '> ⚠️ **ACTION REQUIRED BEFORE CONSULTING:** The syllabus is an external embed '
-            'and could not be read. Please paste your full syllabus text into **Section 14** '
-            'before sending to the GPT.'
-        )
-    elif syl_missing:
-        syl_banner = (
-            '> ⚠️ **ACTION REQUIRED BEFORE CONSULTING:** No syllabus was found in this course export. '
-            'Please paste your syllabus content into **Section 14** before sending to the GPT.'
-        )
-    elif syl_wiki:
-        syl_banner = (
-            '> ℹ️ Syllabus was recovered from a Canvas wiki page (see Section 4). '
-            'If it is incomplete or image-based, paste the full text into **Section 14**.'
-        )
+    if syl_text:
+        syl_banner = '> ✅ Syllabus provided — included in Section 4.'
     else:
-        syl_banner = '> ✅ Syllabus is included in Section 4. No action required.'
+        syl_banner = (
+            '> ⚠️ **No syllabus was provided with this analysis.** '
+            'MeMe will ask for it at the start of the consultation.'
+        )
 
     # ── Header ──
     L += [
@@ -988,48 +837,13 @@ def build_analysis_document(data, identity, modules, grading_groups,
     L += ['', '---']
 
     # ── Section 4: Syllabus ──
-    syllabus_source  = data.get('syllabus_source', 'canvas_tab')
-    lti_tool_name    = data.get('syllabus_lti_tool')
     L += ['', '## SECTION 4: SYLLABUS', '']
-
-    if lti_tool_name:
-        L += [
-            f'> ⚠️ **Agent Note:** The syllabus is delivered via **{lti_tool_name}**, '
-            f'a third-party LTI tool integrated into Canvas navigation.',
-            '> LTI tool content is hosted on the tool provider\'s platform and is not',
-            '> exported inside the IMSCC file. The agent cannot read it.',
-            '',
-            f'**What this means for your consultation:**',
-            f'CeCe will ask you to share the syllabus content from {lti_tool_name} '
-            f'early in the session.',
-            '',
-            f'**How to get your syllabus content:**',
-            f'1. Open your Canvas course',
-            f'2. Click **{lti_tool_name}** in the course navigation menu',
-            f'3. Select all the text (Ctrl+A / Cmd+A) and copy it',
-            f'4. Paste it into the chat when CeCe asks',
-        ]
-    elif data['syllabus_is_embed']:
-        L += [
-            '> ⚠️ **Agent Note:** The syllabus is hosted externally and cannot be read.',
-            '> Links found:', '',
-        ]
-        for link in data['syllabus_links']:
-            L.append(f'- {link}')
-        L += [
-            '',
-            'CeCe will ask you to share syllabus content early in the session.',
-        ]
-    elif data['syllabus_text']:
-        if syllabus_source == 'wiki_page':
-            L.append('> ℹ️ **Agent Note:** Canvas syllabus tab was empty. '
-                     'Content recovered from a syllabus wiki page.')
-            L.append('')
-        L.append(data['syllabus_text'])
+    if syl_text:
+        L.append(syl_text)
     else:
         L += [
-            '*No syllabus content found in the Canvas tab or any wiki page.*',
-            '*CeCe will ask the instructor to share it during consultation.*',
+            '*No syllabus was provided with this analysis.*',
+            '*MeMe will request it at the start of the consultation.*',
         ]
     L += ['', '---']
 
@@ -1272,14 +1086,10 @@ def build_analysis_document(data, identity, modules, grading_groups,
     # ── Section 13: Agent Flags ──
     L += ['', '## SECTION 13: AGENT FLAGS', '']
     flags = []
-    if data.get('syllabus_lti_tool'):
-        flags.append(f'⚠️ Syllabus is in {data["syllabus_lti_tool"]} (LTI tool) — CeCe must ask instructor to paste it')
-    elif data['syllabus_is_embed']:
-        flags.append('⚠️ Syllabus is external — CeCe should ask for content early')
-    elif not data['syllabus_text']:
-        flags.append('⚠️ No syllabus found anywhere — CeCe must ask instructor')
-    elif data.get('syllabus_source') == 'wiki_page':
-        flags.append('ℹ️ Syllabus found in wiki page (not Canvas syllabus tab) — included in analysis')
+    if not syl_text:
+        flags.append('⚠️ No syllabus provided — MeMe will request it at the start of consultation')
+    else:
+        flags.append(f'✅ Syllabus provided ({len(syl_text):,} chars) — included in Section 4')
     if not objectives:
         flags.append('⚠️ No objectives auto-detected — likely in external syllabus')
     if not grading_groups:
@@ -1305,24 +1115,22 @@ def build_analysis_document(data, identity, modules, grading_groups,
     # ── Section 14: Instructor-Provided Syllabus ──
     L += [
         '', '## SECTION 14: SYLLABUS (INSTRUCTOR PROVIDED)',
-        '> **Instructions:** If your syllabus could not be read from the course export',
-        '> (LTI tool, external embed, or not found), paste the full text below.',
-        '> Replace this placeholder text entirely. Include: course description,',
-        '> learning objectives, grading breakdown, policies, and schedule if present.',
+        '> Syllabus is provided here for MeMe to use during QM consultation.',
+        '> Include: course description, learning objectives, grading breakdown,',
+        '> policies, and schedule.',
         '', '---',
         '',
     ]
-    if syl_lti or syl_embed or syl_missing:
+    if syl_text:
         L += [
-            '**Paste your complete syllabus text here:**',
-            '',
-            '*[REPLACE THIS LINE WITH YOUR SYLLABUS CONTENT]*',
+            '*(Syllabus was provided with this analysis — see Section 4.)*',
             '',
         ]
     else:
         L += [
-            f'*(Syllabus was captured automatically from the course — see Section 4.*',
-            '* If that version is incomplete, paste the full text here.)*',
+            '**Paste your complete syllabus text here if MeMe requests it:**',
+            '',
+            '*[REPLACE THIS LINE WITH YOUR SYLLABUS CONTENT]*',
             '',
         ]
     L += ['', '---']
@@ -1350,11 +1158,9 @@ def build_analysis_document(data, identity, modules, grading_groups,
         'YOUR PRIORITIES (in order):',
         '',
         '1. SYLLABUS — Your first move is always the syllabus.',
-        ('- SYLLABUS: Provided in Section 14 — use it as your primary source for CLOs, policies, and grading.'
-         if syl_lti or syl_embed or syl_missing
-         else '- SYLLABUS: Recovered from a wiki page — included in Section 4. If incomplete, check Section 14.'
-         if syl_wiki
-         else '- SYLLABUS: Included in Section 4.'),
+        ('- SYLLABUS: Included in Section 4 — use it as your primary source for CLOs, policies, and grading.'
+         if syl_text
+         else '- SYLLABUS: Not provided yet. Ask for it before proceeding with any QM analysis.'),
         '   If Section 14 says [REPLACE THIS LINE], the instructor has not pasted it yet.',
         '   Do not proceed with QM analysis until you have the full syllabus.',
         '   Ask warmly: "Before we begin — could you paste your course syllabus into our chat?',
@@ -1415,15 +1221,28 @@ def main():
         print('        python analyze.py your-course.imscc --output my-analysis.md')
         sys.exit(1)
 
-    imscc_path = sys.argv[1]
-    if '--output' in sys.argv:
-        output_path = sys.argv[sys.argv.index('--output') + 1]
+    imscc_path   = sys.argv[1]
+    output_path  = None
+    syllabus_txt = ''
+
+    args = sys.argv[2:]
+    while args:
+        arg = args.pop(0)
+        if arg == '--output'   and args: output_path  = args.pop(0)
+        if arg == '--syllabus' and args:
+            syl_path = args.pop(0)
+            with open(syl_path, 'r', encoding='utf-8', errors='ignore') as sf:
+                syllabus_txt = sf.read()
+            print(f'   Syllabus loaded from: {syl_path} ({len(syllabus_txt):,} chars)')
+
+    if not output_path:
+        pass  # set below
     else:
         base        = os.path.splitext(os.path.basename(imscc_path))[0]
         output_path = f'{base}_analysis.md'
 
     print('\n📖 Reading course content...')
-    data = read_imscc(imscc_path)
+    data = read_imscc(imscc_path, syllabus_text=syllabus_txt)
 
     print('\n🔍 Extracting course structure...')
     identity       = extract_course_identity(data)
@@ -1452,18 +1271,11 @@ def main():
             print(f'              ⬜ {name[:50]} (unpublished — not analyzed)')
     print(f'   Wiki pages:  {stats.get("wiki_published",0)} published | '
           f'{stats.get("wiki_unpublished",0)} unpublished (skipped)')
-    if data.get('syllabus_lti_tool'):
-        print(f'   Syllabus:    ⚠️ LTI tool ({data["syllabus_lti_tool"]}) — cannot be read by agent')
-    elif data['syllabus_is_embed']:
-        print(f'   Syllabus:    External embed ({len(data["syllabus_links"])} links)')
-        for lnk in data['syllabus_links']:
-            print(f'              {lnk[:80]}')
-    elif data.get('syllabus_source') == 'wiki_page':
-        print(f'   Syllabus:    Found in wiki page ({len(data["syllabus_text"])} characters)')
-    elif data['syllabus_text']:
-        print(f'   Syllabus:    Canvas tab ({len(data["syllabus_text"])} characters)')
+    syl = data.get('syllabus_text', '')
+    if syl:
+        print(f'   Syllabus:    ✅ Provided ({len(syl):,} chars)')
     else:
-        print(f'   Syllabus:    ⚠️ Not found — CeCe will ask instructor')
+        print(f'   Syllabus:    ⚠️ Not provided — MeMe will request it')
 
     print('\n✅ Running QM/UDL pre-check...')
     qm_results  = run_qm_precheck(data, modules, grading_groups, objectives)
