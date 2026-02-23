@@ -182,13 +182,57 @@ syllabus_text = st.text_area(
 )
 
 syl_file = st.file_uploader(
-    label="Or upload a plain-text syllabus (.txt)",
-    type=["txt"],
-    help="If your syllabus is a plain text file, upload it here instead of pasting.",
+    label="Or upload your syllabus (.txt, .docx, or .pdf)",
+    type=["txt", "docx", "pdf"],
+    help="Upload your syllabus file. Plain text and Word docs give the best results.",
 )
 if syl_file is not None:
-    syllabus_text = syl_file.read().decode("utf-8", errors="ignore")
-    st.success(f"✅ Loaded {len(syllabus_text):,} characters from {syl_file.name}")
+    fname = syl_file.name.lower()
+    try:
+        if fname.endswith(".txt"):
+            syllabus_text = syl_file.read().decode("utf-8", errors="ignore")
+
+        elif fname.endswith(".docx"):
+            import io, zipfile as _zf
+            import xml.etree.ElementTree as _ET
+            with _zf.ZipFile(io.BytesIO(syl_file.read())) as dz:
+                xml_bytes = dz.read("word/document.xml")
+            root = _ET.fromstring(xml_bytes)
+            ns   = {"w": "http://schemas.openxmlformats.org/wordprocessingml/2006/main"}
+            paras = root.findall(".//w:p", ns)
+            lines = []
+            for p in paras:
+                text = "".join(t.text or "" for t in p.findall(".//w:t", ns)).strip()
+                if text:
+                    lines.append(text)
+            syllabus_text = "\n".join(lines)
+
+        elif fname.endswith(".pdf"):
+            try:
+                import io
+                import pdfplumber
+                with pdfplumber.open(io.BytesIO(syl_file.read())) as pdf:
+                    pages = [page.extract_text() or "" for page in pdf.pages]
+                syllabus_text = "\n".join(pages).strip()
+            except ImportError:
+                # Fallback: pypdf if pdfplumber not installed
+                import io
+                import pypdf
+                reader = pypdf.PdfReader(io.BytesIO(syl_file.read()))
+                syllabus_text = "\n".join(
+                    page.extract_text() or "" for page in reader.pages
+                ).strip()
+
+        if syllabus_text and syllabus_text.strip():
+            st.success(f"✅ Extracted {len(syllabus_text):,} characters from {syl_file.name}")
+        else:
+            st.warning(
+                f"⚠️ Could not extract readable text from {syl_file.name}. "
+                "This sometimes happens with scanned PDFs or image-based documents. "
+                "Please paste your syllabus text in the box above instead."
+            )
+    except Exception as e:
+        st.error(f"Could not read {syl_file.name}: {e}. Please paste your syllabus text above.")
 
 if not syllabus_text or not syllabus_text.strip():
     st.warning(
