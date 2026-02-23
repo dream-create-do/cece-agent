@@ -144,8 +144,9 @@ with st.expander("ℹ️ How to export your course from Canvas"):
     """)
 
 
-# ── File uploader ────────────────────────────────────────────────
-st.markdown('<p class="section-header">Step 1 — Upload your course file</p>',
+
+# ── Step 1: Course file ──────────────────────────────────────────
+st.markdown('<p class="section-header">Step 1 — Upload your course export</p>',
             unsafe_allow_html=True)
 
 uploaded = st.file_uploader(
@@ -156,13 +157,47 @@ uploaded = st.file_uploader(
 )
 
 if uploaded is None:
-    st.info("Upload a .imscc file above to get started. "
-            "If your file ends in .zip, that works too.")
+    st.info("Upload a .imscc file above to get started.")
     st.stop()
 
+# ── Step 2: Syllabus ─────────────────────────────────────────────
+st.markdown('<p class="section-header">Step 2 — Provide your syllabus</p>',
+            unsafe_allow_html=True)
 
-# ── Run analysis ─────────────────────────────────────────────────
-st.markdown('<p class="section-header">Step 2 — Analyze</p>',
+st.markdown(
+    "MeMe needs your syllabus to evaluate QM Standards 1, 2, and 3 accurately. "
+    "Paste the full text below, or upload a .txt file."
+)
+
+syllabus_text = st.text_area(
+    label="Paste syllabus text",
+    height=220,
+    placeholder=(
+        "Paste your full syllabus here — course description, learning objectives, "
+        "grading breakdown, and policies...\n\n"
+        "Tip: If your syllabus is in a .docx or PDF, open it, select all (Ctrl+A), "
+        "and paste the text here."
+    ),
+    label_visibility="collapsed",
+)
+
+syl_file = st.file_uploader(
+    label="Or upload a plain-text syllabus (.txt)",
+    type=["txt"],
+    help="If your syllabus is a plain text file, upload it here instead of pasting.",
+)
+if syl_file is not None:
+    syllabus_text = syl_file.read().decode("utf-8", errors="ignore")
+    st.success(f"✅ Loaded {len(syllabus_text):,} characters from {syl_file.name}")
+
+if not syllabus_text or not syllabus_text.strip():
+    st.warning(
+        "⚠️ No syllabus provided. MeMe will not be able to evaluate learning objectives, "
+        "policies, or CLO alignment without it. You can still run the analysis."
+    )
+
+# ── Step 3: Run ──────────────────────────────────────────────────
+st.markdown('<p class="section-header">Step 3 — Analyze</p>',
             unsafe_allow_html=True)
 
 run_button = st.button("▶  Run Analysis", type="primary", use_container_width=True)
@@ -170,24 +205,26 @@ run_button = st.button("▶  Run Analysis", type="primary", use_container_width=
 if not run_button and "last_result" not in st.session_state:
     st.stop()
 
-# Run (or use cached result if file hasn't changed)
-file_id = f"{uploaded.name}_{uploaded.size}"
+# Run (or use cached result if file/syllabus hasn't changed)
+file_id = f"{uploaded.name}_{uploaded.size}_{len(syllabus_text or '')}"
 
 if run_button or st.session_state.get("last_file_id") != file_id:
 
     with st.spinner("Reading course content and running QM/UDL pre-check..."):
         try:
-            # Capture print() output for the progress log
             import sys
             from io import StringIO
             log_capture = StringIO()
             sys.stdout = log_capture
 
-            # Read the uploaded file bytes
             file_bytes = uploaded.read()
 
-            # Run the analysis engine
-            data           = read_imscc(uploaded.name, file_bytes=file_bytes)
+            data = read_imscc(
+                uploaded.name,
+                file_bytes=file_bytes,
+                syllabus_text=(syllabus_text or "").strip(),
+            )
+
             identity       = extract_course_identity(data)
             modules        = extract_modules(data)
             grading_groups = extract_grading_structure(data)
@@ -293,21 +330,10 @@ col_d.metric("🔍 Needs Review", review_ct)
 
 # ── Syllabus status ──
 st.markdown("")
-lti_tool = data.get("syllabus_lti_tool")
-syl_source = data.get("syllabus_source")
-
-if lti_tool:
-    st.warning(f"**Syllabus:** Delivered via **{lti_tool}** (LTI tool) — "
-               f"content cannot be extracted. CeCe will ask you to paste it during consultation.")
-elif data.get("syllabus_is_embed"):
-    st.warning("**Syllabus:** External embed detected — content not readable. "
-               "CeCe will ask you to share it.")
-elif syl_source == "wiki_page":
-    st.success("**Syllabus:** Found in a Canvas wiki page and included in the analysis.")
-elif data.get("syllabus_text"):
-    st.success("**Syllabus:** Read from Canvas syllabus tab.")
+if data.get("syllabus_text"):
+    st.success(f"**Syllabus:** Included in the analysis ({len(data['syllabus_text']):,} characters).")
 else:
-    st.warning("**Syllabus:** Not found. CeCe will ask for it during consultation.")
+    st.warning("**Syllabus:** Not provided. MeMe will request it at the start of consultation.")
 
 # ── Unpublished note ──
 unpub_assign = stats.get("assign_unpublished", 0)
