@@ -26,6 +26,8 @@ try:
         extract_grading_structure,
         extract_rubrics,
         extract_learning_objectives,
+        extract_syllabus_objectives,
+        compare_objectives,
         run_qm_precheck,
         run_udl_precheck,
         calculate_health_score,
@@ -274,13 +276,17 @@ if run_button or st.session_state.get("last_file_id") != file_id:
             grading_groups = extract_grading_structure(data)
             rubrics        = extract_rubrics(data)
             objectives     = extract_learning_objectives(data, modules)
+            syl_objectives = extract_syllabus_objectives(data)
+            comparison     = compare_objectives(objectives, syl_objectives)
             qm_results     = run_qm_precheck(data, modules, grading_groups, objectives)
             udl_results    = run_udl_precheck(data)
             qm_counts      = calculate_health_score(qm_results)
             document       = build_analysis_document(
                                 data, identity, modules, grading_groups,
                                 objectives, qm_results, udl_results,
-                                rubrics, qm_counts)
+                                rubrics, qm_counts,
+                                syl_objectives=syl_objectives,
+                                comparison=comparison)
 
             sys.stdout = sys.__stdout__
             log_output = log_capture.getvalue()
