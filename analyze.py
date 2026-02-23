@@ -528,42 +528,167 @@ def extract_rubrics(data):
     return rubrics
 
 
-def extract_learning_objectives(data, modules):
-    objectives  = []
-    found_texts = set()
-    priority_keys = ['objective','overview','syllabus','welcome','introduction',
-                     'getting-started','the-right-stuff','activities','start-here']
-    search_pages = {k: v for k, v in data.get('wiki_full', {}).items()
-                    if any(p in k.lower() for p in priority_keys)}
-    for mod in modules:
-        mod_words = [w for w in re.split(r'[\s|]+', mod['title'].lower()) if len(w) > 3]
-        for page_name, content in data.get('wiki_full', {}).items():
-            if any(w in page_name.lower() for w in mod_words):
-                search_pages[page_name] = content
-    patterns = [
-        r'(?:students\s+will|you\s+will|learners\s+will)\s+([^.!?\n]{15,200})[.!?]',
-        r'by\s+the\s+end\s+of\s+(?:this\s+)?(?:module|week|course|unit)[^,]*,?\s*'
-        r'(?:you\s+will\s+be\s+able\s+to|you\s+will|students\s+will)\s*:?\s*([^.!?\n]{15,200})',
-        r'upon\s+completion[^,]*,\s*([^.!?\n]{15,200})[.!?]',
-        r'(?:clo|slo|lo|learning\s+objective)\s*[-:#]?\s*\d*\s*[:.]\s*([^.\n]{15,200})',
+def _extract_objectives_from_text(text, source_label, found_norms=None):
+    """
+    Extract objective statements from a single block of text.
+    Returns list of dicts: {text, blooms, source, location}
+    found_norms: set of already-seen normalized texts (for deduplication across calls)
+    """
+    if found_norms is None:
+        found_norms = set()
+
+    results = []
+
+    PATTERNS = [
+        # "Students/You/Learners will <verb> ..."
+        r'(?:students|you|learners|participants)\s+will\s+([^.!?\n]{15,250})[.!?\n]',
+        # "By the end of this module/week/course, you will be able to ..."
+        r'by\s+the\s+end\s+of\s+(?:this\s+)?(?:module|week|course|unit|lesson)[^,\n]*'
+        r',?\s*(?:you\s+will\s+be\s+able\s+to|you\s+will|students\s+will)\s*:?\s*'
+        r'([^.!?\n]{15,250})',
+        # "Upon completion of this module/course, ..."
+        r'upon\s+completion\s+of\s+(?:this\s+)?(?:module|course|unit|lesson)[^,\n]*'
+        r',?\s*(?:students|you|learners)\s+will\s+([^.!?\n]{15,250})',
+        # Explicit labels: CLO, MLO, SLO, LO, Course/Learning/Module Objective
+        r'(?:clo|mlo|slo|lo|course\s+objective|learning\s+objective|module\s+objective)'
+        r'\s*[-:#]?\s*\d*\s*[:.]\s*([^.\n]{15,250})',
+        # Numbered/bulleted lines beginning with a capitalized action word
+        r'(?:^|\n)\s*(?:\d+[.)]\s*|[-\u2022*]\s*)([A-Z][a-z]{2,}\s[^.\n]{15,200})',
     ]
-    for page_name, content in search_pages.items():
-        for pattern in patterns:
-            for match in re.findall(pattern, content, re.IGNORECASE | re.DOTALL):
-                if isinstance(match, tuple):
-                    match = ' '.join(m for m in match if m)
-                clean = re.sub(r'\s+', ' ', match).strip()
-                if len(clean) > 20 and clean not in found_texts:
-                    found_texts.add(clean)
-                    objectives.append({'text': clean[:200],
-                                       'blooms': detect_blooms_level(clean),
-                                       'source': page_name})
-    return objectives[:25]
+
+    SECTION_RE = re.compile(
+        r'(?:course\s+)?(?:learning\s+)?objectives?\s*:?[ \t]*\n((?:[^\n]+\n){1,30})',
+        re.IGNORECASE
+    )
+
+    def _add(raw):
+        clean = re.sub(r'\s+', ' ', raw).strip().rstrip('.,;')
+        if len(clean) < 20:
+            return
+        if re.search(r'href=|<[a-z]+|click here|log.?in|canvas\.', clean, re.IGNORECASE):
+            return
+        norm = re.sub(r'\s+', ' ', clean.lower())
+        if norm not in found_norms:
+            found_norms.add(norm)
+            results.append({
+                'text':   clean[:200],
+                'blooms': detect_blooms_level(clean),
+                'source': source_label,
+            })
+
+    # 1. Objective section blocks
+    for sec in SECTION_RE.finditer(text):
+        for line in sec.group(1).splitlines():
+            line = re.sub(r'^[\s\d.)\-\u2022*]+', '', line).strip()
+            if detect_blooms_level(line) != 'Unclear':
+                _add(line)
+
+    # 2. Regex patterns across full text
+    for pattern in PATTERNS:
+        for match in re.finditer(pattern, text, re.IGNORECASE | re.MULTILINE):
+            raw = match.group(1) if match.lastindex else match.group(0)
+            _add(raw)
+
+    return results
 
 
-# ─────────────────────────────────────────────────────────────
-#  QM / UDL PRE-CHECK
-# ─────────────────────────────────────────────────────────────
+def _fuzzy_match(text_a, text_b, threshold=0.55):
+    """
+    Returns True if two objective texts are likely the same objective.
+    Uses word-overlap ratio on normalized lowercase text.
+    """
+    STOPWORDS = {'the','a','an','and','or','to','of','in','for','is','are',
+                 'will','be','able','that','this','their','its','by','at',
+                 'students','you','learners','participants','course','module'}
+
+    def words(t):
+        return set(re.findall(r'\b[a-z]{3,}\b', t.lower())) - STOPWORDS
+
+    wa, wb = words(text_a), words(text_b)
+    if not wa or not wb:
+        return False
+    overlap = len(wa & wb)
+    return overlap / min(len(wa), len(wb)) >= threshold
+
+
+def extract_learning_objectives(data, modules):
+    """
+    Two-corpus objective extraction:
+      1. Course corpus  (ALL published wiki pages + ALL assignment instructions) → authority
+      2. Syllabus corpus (user-provided syllabus text) → checked against course
+
+    Returns a list of objective dicts, each with:
+      text, blooms, source, location ('course' | 'syllabus' | 'both')
+
+    Course-only objectives are flagged: present in course but missing from syllabus.
+    Syllabus-only objectives are flagged: stated in syllabus but not found in course.
+    """
+    course_norms = set()   # dedup within course corpus
+    syl_norms    = set()   # dedup within syllabus corpus
+
+    # ── 1. Extract from course corpus ────────────────────────────────
+    # Sort pages so objective/overview/module pages come first
+    PRIORITY_KEYS = ['objective','overview','welcome','introduction','getting-started',
+                     'start-here','outcomes','goals','competenc','module','week','unit']
+
+    def page_priority(name):
+        n = name.lower()
+        for i, k in enumerate(PRIORITY_KEYS):
+            if k in n:
+                return i
+        return len(PRIORITY_KEYS)
+
+    wiki_pages = sorted(data.get('wiki_full', {}).items(),
+                        key=lambda x: page_priority(x[0]))
+
+    course_objectives = []
+    for page_name, content in wiki_pages:
+        if content and len(content.strip()) > 80:
+            found = _extract_objectives_from_text(content, page_name, course_norms)
+            course_objectives.extend(found)
+
+    # Also scan every published assignment's instructions
+    for assign_name, det in data.get('assignments', {}).items():
+        instructions = det.get('instructions', '').strip()
+        if instructions and len(instructions) > 80:
+            label = f'[Assignment] {assign_name}'
+            found = _extract_objectives_from_text(instructions, label, course_norms)
+            course_objectives.extend(found)
+
+    # ── 2. Extract from syllabus ──────────────────────────────────────
+    syl_text = data.get('syllabus_text', '').strip()
+    syllabus_objectives = []
+    if syl_text:
+        syllabus_objectives = _extract_objectives_from_text(syl_text, '[Syllabus]', syl_norms)
+
+    # ── 3. Cross-reference ────────────────────────────────────────────
+    # For each course objective: does it appear in the syllabus?
+    for obj in course_objectives:
+        matched = any(_fuzzy_match(obj['text'], s['text']) for s in syllabus_objectives)
+        obj['location'] = 'both' if matched else 'course_only'
+
+    # For each syllabus objective: does it appear in the course?
+    syllabus_only = []
+    for syl_obj in syllabus_objectives:
+        matched = any(_fuzzy_match(syl_obj['text'], c['text']) for c in course_objectives)
+        if not matched:
+            syl_obj['location'] = 'syllabus_only'
+            syllabus_only.append(syl_obj)
+
+    # ── 4. Combine: course objectives first, then unmatched syllabus ones
+    all_objectives = course_objectives + syllabus_only
+
+    # Deduplicate near-matches by first 60 chars
+    seen_prefixes = set()
+    deduped = []
+    for obj in all_objectives:
+        prefix = obj['text'][:60].lower().strip()
+        if prefix not in seen_prefixes:
+            seen_prefixes.add(prefix)
+            deduped.append(obj)
+
+    return deduped[:60]
+
 
 def run_qm_precheck(data, modules, grading_groups, objectives):
     results     = {}
@@ -850,23 +975,48 @@ def build_analysis_document(data, identity, modules, grading_groups,
     # ── Section 5: Learning Objectives ──
     L += [
         '', '## SECTION 5: LEARNING OBJECTIVES DETECTED',
-        '> Auto-detected from published pages only. CeCe will evaluate and refine.', '',
+        '> **Course is the authority.** Objectives are extracted from all published pages and',
+        '> assignment instructions, then checked against the syllabus.',
+        '> ✅ both = found in course AND syllabus | ⚠️ course_only = in course, missing from syllabus',
+        '> ❌ syllabus_only = stated in syllabus, not found anywhere in the course', '',
     ]
     if objectives:
-        L += ['| # | Source Page | Objective | Bloom\'s Level |',
-              '|---|-------------|-----------|--------------|']
+        course_only   = [o for o in objectives if o.get('location') == 'course_only']
+        syllabus_only = [o for o in objectives if o.get('location') == 'syllabus_only']
+        matched       = [o for o in objectives if o.get('location') == 'both']
+
+        # Summary line
+        L.append(f'**Summary:** {len(matched)} matched ✅ | '
+                 f'{len(course_only)} in course only ⚠️ | '
+                 f'{len(syllabus_only)} in syllabus only ❌')
+        L.append('')
+
+        if course_only or syllabus_only:
+            L += [
+                '> ⚠️ **ALIGNMENT GAP DETECTED** — The objectives in the course and syllabus do not fully match.',
+                '> MeMe must reconcile these with the instructor before building the Blueprint.',
+                '',
+            ]
+
+        L += ['| # | Location | Source | Objective | Bloom\'s |',
+              '|---|----------|--------|-----------|---------|']
         for i, obj in enumerate(objectives, 1):
-            L.append(f'| {i} | {obj["source"][:40]} | {obj["text"][:140].replace("|","-")} | {obj["blooms"]} |')
+            loc = obj.get('location', 'course_only')
+            icon = '✅' if loc == 'both' else ('⚠️' if loc == 'course_only' else '❌')
+            L.append(
+                f'| {i} | {icon} {loc} | {obj["source"][:35].replace("|","-")} '
+                f'| {obj["text"][:130].replace("|","-")} | {obj["blooms"]} |'
+            )
     else:
-        L.append('*No objectives auto-detected. Likely in external syllabus. CeCe will address this.*')
+        L.append('*No objectives auto-detected. MeMe must ask the instructor to provide them.*')
     L += ['', '---']
 
     # ── Section 5B: Alignment Matrix ──
     L += [
         '', '## SECTION 5B: ALIGNMENT MATRIX',
         '> Maps Course Learning Objectives → Module Learning Objectives → Assignments.',
-        '> ⚠️ This matrix is auto-generated from detectable content only.',
-        '> The GPT consultant must verify and complete it using the full syllabus.', '',
+        '> Built from course content (the authority). Syllabus mismatches noted in Section 5.',
+        '> ⚠️ Auto-generated — MeMe must verify chains and fill gaps during consultation.', '',
     ]
 
     # Build a lookup: module title → assignments in that module
@@ -1157,14 +1307,15 @@ def build_analysis_document(data, identity, modules, grading_groups,
         '',
         'YOUR PRIORITIES (in order):',
         '',
-        '1. SYLLABUS — Your first move is always the syllabus.',
-        ('- SYLLABUS: Included in Section 4 — use it as your primary source for CLOs, policies, and grading.'
+        '1. OBJECTIVE ALIGNMENT — The course is the authority, not the syllabus.',
+        ('- Section 5 shows ALL objectives found in the course (wiki pages + assignment instructions).',
+         ),
+        ('- Each objective is tagged: ✅ both (in course AND syllabus) | ⚠️ course_only | ❌ syllabus_only.'
          if syl_text
-         else '- SYLLABUS: Not provided yet. Ask for it before proceeding with any QM analysis.'),
-        '   If Section 14 says [REPLACE THIS LINE], the instructor has not pasted it yet.',
-        '   Do not proceed with QM analysis until you have the full syllabus.',
-        '   Ask warmly: "Before we begin — could you paste your course syllabus into our chat?',
-        '   This helps me give you accurate feedback on standards 1, 2, and 3."',
+         else '- SYLLABUS: Not provided yet. Request it so you can check objective alignment.'),
+        '   If any course_only or syllabus_only objectives exist, reconcile with the instructor first.',
+        '   Ask: "I noticed your course pages mention [X] but your syllabus states [Y] — which is current?"',
+        '   Do not build the Blueprint until objectives are reconciled.',
         '',
         '2. ALIGNMENT — QM 2.4 and 2.5 are the backbone of a certifiable course.',
         '   Section 5B shows a preliminary alignment matrix. Your job is to:',
