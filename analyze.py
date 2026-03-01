@@ -991,7 +991,8 @@ def calculate_health_score(qm_results):
 def build_analysis_document(data, identity, modules, grading_groups,
                              objectives, qm_results, udl_results,
                              rubrics, qm_counts,
-                             syl_objectives=None, comparison=None):
+                             syl_objectives=None, comparison=None,
+                             llm_sections=None):
     met, partial, not_met, review_ct, recommendation = qm_counts
     today = datetime.now().strftime('%Y-%m-%d %H:%M')
     stats = data.get('publish_stats', {})
@@ -1502,6 +1503,10 @@ def build_analysis_document(data, identity, modules, grading_groups,
         L += [f'### {page_name}', '', content, '']
     L += ['', '---']
 
+    # ── LLM Deep Analysis Sections (if available) ──
+    if llm_sections:
+        L += llm_sections
+
     # ── Section 13: Agent Flags ──
     L += ['', '## SECTION 13: AGENT FLAGS', '']
     flags = []
@@ -1571,6 +1576,8 @@ def build_analysis_document(data, identity, modules, grading_groups,
         '- Section 5B: Alignment matrix — CLOs → MLOs → Assignments',
         '- Section 7:  Module and week structure',
         '- Section 8:  Assignment inventory',
+        '- LLM-Powered QM Deep Analysis (if present — AI-evaluated per-standard results)',
+        '- Executive Summary & Needs Assessment (if present — AI-generated priorities)',
         '- Section 13: Agent flags',
         '- Section 14: Instructor-provided syllabus (check here first if Section 4 is empty)',
         '',

@@ -14,7 +14,7 @@ st.set_page_config(
     page_title="CeCe Course Analysis Agent",
     page_icon="🎓",
     layout="centered",
-    initial_sidebar_state="collapsed",
+    initial_sidebar_state="expanded",
 )
 
 # ── Import the analysis engine ──────────────────────────────────
@@ -36,6 +36,14 @@ try:
 except ImportError as e:
     st.error(f"Could not load analyze.py: {e}")
     st.stop()
+
+# ── Import the LLM analysis engine (optional) ────────────────
+LLM_AVAILABLE = False
+try:
+    from llm_analysis import run_llm_analysis, build_llm_sections
+    LLM_AVAILABLE = True
+except ImportError:
+    pass  # LLM analysis not available — anthropic package not installed
 
 
 # ── Styles ──────────────────────────────────────────────────────
@@ -126,6 +134,45 @@ st.markdown("""
     <p>Course Analysis Agent &nbsp;·&nbsp; Quality Matters · UDL · Fink's Framework</p>
 </div>
 """, unsafe_allow_html=True)
+
+
+# ── Sidebar: LLM Analysis Settings ─────────────────────────────
+with st.sidebar:
+    st.markdown("### ⚙️ Analysis Settings")
+
+    # Check for API key in secrets
+    api_key = None
+    if LLM_AVAILABLE:
+        api_key = st.secrets.get("ANTHROPIC_API_KEY", None)
+
+    if LLM_AVAILABLE and api_key:
+        enable_llm = st.toggle(
+            "🧠 Enable AI Deep Analysis",
+            value=True,
+            help="Uses Claude (Anthropic) to evaluate each QM standard with "
+                 "genuine pedagogical reasoning. Adds ~60-90 seconds and costs "
+                 "~$0.15-0.40 per analysis.",
+        )
+        if enable_llm:
+            st.success("AI analysis enabled — API key loaded from secrets.")
+            st.caption(
+                "CeCe will make ~10 focused API calls to evaluate your course "
+                "against all 44 QM standards and UDL, then generate an executive "
+                "summary with prioritized recommendations."
+            )
+    elif LLM_AVAILABLE and not api_key:
+        enable_llm = False
+        st.warning(
+            "To enable AI deep analysis, add your Anthropic API key to "
+            "`.streamlit/secrets.toml`:\n\n"
+            '```\nANTHROPIC_API_KEY = "sk-ant-..."\n```'
+        )
+    else:
+        enable_llm = False
+        st.info(
+            "AI deep analysis requires the `anthropic` package.\n\n"
+            "`pip install anthropic`"
+        )
 
 
 # ── Intro ────────────────────────────────────────────────────────
@@ -281,15 +328,52 @@ if run_button or st.session_state.get("last_file_id") != file_id:
             qm_results     = run_qm_precheck(data, modules, grading_groups, objectives)
             udl_results    = run_udl_precheck(data)
             qm_counts      = calculate_health_score(qm_results)
-            document       = build_analysis_document(
-                                data, identity, modules, grading_groups,
-                                objectives, qm_results, udl_results,
-                                rubrics, qm_counts,
-                                syl_objectives=syl_objectives,
-                                comparison=comparison)
 
             sys.stdout = sys.__stdout__
             log_output = log_capture.getvalue()
+
+            # ── LLM Deep Analysis (optional) ──
+            llm_results = None
+            llm_sections = None
+
+            if enable_llm and api_key:
+                llm_status = st.empty()
+                llm_progress = st.progress(0, text="Starting AI deep analysis...")
+
+                progress_messages = []
+                call_count = [0]
+
+                def llm_progress_callback(msg):
+                    progress_messages.append(msg)
+                    call_count[0] += 1
+                    # 10 total calls expected (8 GS + UDL + Summary)
+                    pct = min(call_count[0] / 11, 0.99)
+                    llm_progress.progress(pct, text=msg)
+
+                try:
+                    llm_results = run_llm_analysis(
+                        api_key=api_key,
+                        data=data,
+                        modules=modules,
+                        objectives=objectives,
+                        grading_groups=grading_groups,
+                        rubrics=rubrics,
+                        identity=identity,
+                        progress_callback=llm_progress_callback,
+                    )
+                    llm_sections = build_llm_sections(llm_results)
+                    llm_progress.progress(1.0, text="✅ AI analysis complete!")
+                except Exception as llm_err:
+                    llm_status.warning(f"AI analysis encountered an error: {llm_err}")
+                    log_output += f"\n\nLLM Analysis Error:\n{traceback.format_exc()}"
+
+            document = build_analysis_document(
+                            data, identity, modules, grading_groups,
+                            objectives, qm_results, udl_results,
+                            rubrics, qm_counts,
+                            syl_objectives=syl_objectives,
+                            comparison=comparison,
+                            llm_sections=llm_sections)
 
             # Cache result
             st.session_state["last_result"]  = {
@@ -303,6 +387,7 @@ if run_button or st.session_state.get("last_file_id") != file_id:
                 "data":           data,
                 "log":            log_output,
                 "filename":       uploaded.name,
+                "llm_results":    llm_results,
             }
             st.session_state["last_file_id"] = file_id
 
@@ -391,6 +476,41 @@ unpub_pages  = stats.get("wiki_unpublished",   0)
 if unpub_assign > 0 or unpub_pages > 0:
     st.info(f"ℹ️ **{unpub_pages} pages** and **{unpub_assign} assignments** were unpublished "
             f"and excluded from the analysis.")
+
+# ── LLM Analysis Summary (if available) ──
+llm_results = result.get("llm_results")
+if llm_results:
+    st.markdown("")
+    st.markdown('<p class="section-header">🧠 AI Deep Analysis Results</p>',
+                unsafe_allow_html=True)
+
+    gs_results = llm_results.get("gs_results", {})
+    # Count LLM-evaluated statuses across all GS
+    llm_met = llm_partial = llm_not_met = llm_review = 0
+    for gs_num, gs_res in gs_results.items():
+        for ev in gs_res.get("evaluations", []):
+            status = ev.get("status", "")
+            if status == "Met":          llm_met += 1
+            elif status == "Partially Met": llm_partial += 1
+            elif status == "Not Met":    llm_not_met += 1
+            else:                        llm_review += 1
+
+    lcol1, lcol2, lcol3, lcol4 = st.columns(4)
+    lcol1.metric("✅ Met",          llm_met)
+    lcol2.metric("⚠️ Partial",      llm_partial)
+    lcol3.metric("❌ Not Met",      llm_not_met)
+    lcol4.metric("🔍 Review",       llm_review)
+
+    # Token usage summary
+    usage = llm_results.get("token_usage", [])
+    if usage:
+        total_in = sum(u.get("input_tokens", 0) for u in usage)
+        total_out = sum(u.get("output_tokens", 0) for u in usage)
+        st.caption(f"Analysis used {total_in:,} input + {total_out:,} output tokens across {len(usage)} API calls.")
+
+    if llm_results.get("errors"):
+        for err in llm_results["errors"]:
+            st.warning(f"⚠️ {err}")
 
 
 # ── Download ─────────────────────────────────────────────────────
