@@ -378,36 +378,40 @@ with st.expander("🔬 Rubric XML Diagnostic"):
     else:
         st.markdown(f"**Raw rubrics.xml:** {len(raw_rubric_xml):,} characters")
 
-        # Show unique XML tags
-        import re as _re
-        tags = sorted(set(_re.findall(r'<(/?\w+[\w:]*)', raw_rubric_xml)))
-        st.markdown(f"**Unique XML tags found ({len(tags)}):**")
-        tag_lines = []
-        for t in tags:
-            count = raw_rubric_xml.count(f'<{t}')
-            tag_lines.append(f"`<{t}>` — {count} occurrence(s)")
-        st.markdown("  \n".join(tag_lines))
+        # Show what ElementTree actually sees
+        import xml.etree.ElementTree as _ET
+        try:
+            _root = _ET.fromstring(raw_rubric_xml)
+            st.markdown(f"**Root tag:** `{_root.tag}`")
+            st.markdown(f"**Root attribs:** `{_root.attrib}`")
 
-        # Show first rubric block structure
-        blocks = _re.split(r'<rubric\s+identifier=[^>]+>', raw_rubric_xml)
-        if len(blocks) > 1:
-            st.markdown(f"**Rubric blocks found:** {len(blocks) - 1}")
-            st.markdown("**First rubric block (raw XML):**")
-            st.code(blocks[1][:5000], language="xml")
-        else:
-            # Try alternate split
-            blocks2 = _re.split(r'<rubric[\s>]', raw_rubric_xml)
-            if len(blocks2) > 1:
-                st.markdown(f"**Rubric blocks found (alternate split):** {len(blocks2) - 1}")
-                st.markdown("**First rubric block (raw XML):**")
-                st.code(blocks2[1][:5000], language="xml")
-            else:
-                st.warning("Could not split into rubric blocks. Showing raw XML:")
-                st.code(raw_rubric_xml[:8000], language="xml")
+            # Show all direct children of root
+            children = list(_root)
+            st.markdown(f"**Direct children of root ({len(children)}):**")
+            for i, child in enumerate(children[:10]):
+                child_children = list(child)
+                st.markdown(f"- `<{child.tag}>` — {len(child_children)} sub-elements, attribs: `{child.attrib}`")
 
-        st.markdown("---")
-        st.markdown("**Full raw XML** (first 15,000 chars):")
-        st.code(raw_rubric_xml[:15000], language="xml")
+            # Try finding rubric at various depths
+            st.markdown("**Searching for `<rubric>` elements:**")
+            r1 = _root.findall('rubric')
+            r2 = _root.findall('.//rubric')
+            r3 = _root.findall('.//{*}rubric')  # wildcard namespace
+            st.markdown(f"- `findall('rubric')`: {len(r1)}")
+            st.markdown(f"- `findall('.//rubric')`: {len(r2)}")
+            st.markdown(f"- `findall('.//" + "{*}" + "rubric')` (wildcard ns): {len(r3)}")
+
+            # Show first 500 chars of raw XML
+            st.markdown("**First 500 chars of raw XML:**")
+            st.code(raw_rubric_xml[:500], language="xml")
+
+            # If we found rubrics with wildcard, show the namespace
+            if r3 and not r2:
+                st.warning(f"Rubrics found with namespace wildcard! First rubric tag: `{r3[0].tag}`")
+
+        except Exception as _e:
+            st.error(f"XML parse error: {_e}")
+            st.code(raw_rubric_xml[:1000], language="xml")
 
 
 # ── Footer ──────────────────────────────────────────────────────
