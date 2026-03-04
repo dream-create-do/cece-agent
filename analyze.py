@@ -536,19 +536,55 @@ def extract_rubrics(data):
 
     print(f"   Rubrics: raw XML is {len(xml):,} chars")
 
-    # ── Parse with ElementTree (robust, handles any whitespace/formatting) ──
+    # ── Strip XML namespaces (Canvas adds xmlns= which makes tags invisible to ET) ──
+    # Handle both double and single quotes, default and prefixed namespaces
+    clean_xml = re.sub(r'\sxmlns(?::\w+)?\s*=\s*["\'][^"\']*["\']', '', xml)
+    # Strip namespace prefixes from tags like <cc:rubric> → <rubric>
+    clean_xml = re.sub(r'<(/?)[\w]+:', r'<\1', clean_xml)
+    # Strip namespace-prefixed attributes like xsi:schemaLocation="..." that become unbound
+    clean_xml = re.sub(r'\s\w+:\w+\s*=\s*["\'][^"\']*["\']', '', clean_xml)
+
+    print(f"   Rubrics: namespace-stripped XML is {len(clean_xml):,} chars")
+    print(f"   Rubrics: first 200 chars: {clean_xml[:200]}")
+
+    # Verify the tags are present as raw strings
+    raw_rubric_count = clean_xml.count('<rubric>')
+    raw_criteria_count = clean_xml.count('<criterion>')
+    raw_rating_count = clean_xml.count('<rating>')
+    print(f"   Rubrics: raw string counts — <rubric>:{raw_rubric_count} "
+          f"<criterion>:{raw_criteria_count} <rating>:{raw_rating_count}")
+
+    # ── Parse with ElementTree ──
     try:
-        root = ET.fromstring(xml)
+        root = ET.fromstring(clean_xml)
     except ET.ParseError as e:
         print(f"   Rubrics: XML parse error: {e}")
-        print(f"   Rubrics: first 300 chars: {xml[:300]}")
-        return rubrics
+        print(f"   Rubrics: falling back to regex parsing")
+        return _extract_rubrics_regex(clean_xml)
+
+    print(f"   Rubrics: root tag = '{root.tag}', children = {[c.tag for c in list(root)[:5]]}")
 
     # Handle both cases: root IS <rubrics> or root contains <rubrics>
     if root.tag == 'rubrics':
         rubric_elements = root.findall('rubric')
     else:
         rubric_elements = root.findall('.//rubric')
+
+    # Fallback: if still empty, search case-insensitively by iterating all elements
+    if not rubric_elements:
+        print(f"   Rubrics: standard search found 0, trying deep scan...")
+        all_tags = set()
+        for el in root.iter():
+            all_tags.add(el.tag)
+            if el.tag.lower().endswith('rubric') and el.tag != root.tag:
+                rubric_elements.append(el)
+        print(f"   Rubrics: all unique tags in XML: {sorted(all_tags)[:20]}")
+        print(f"   Rubrics: deep scan found {len(rubric_elements)} rubric element(s)")
+
+    # LAST RESORT: if ET completely fails, parse with regex
+    if not rubric_elements:
+        print(f"   Rubrics: ET found nothing — falling back to regex parsing")
+        return _extract_rubrics_regex(clean_xml)
 
     print(f"   Rubrics: found {len(rubric_elements)} <rubric> element(s)")
 
@@ -598,6 +634,97 @@ def extract_rubrics(data):
 
     return rubrics
 
+
+
+def _extract_rubrics_regex(xml):
+    """
+    Regex-based rubric extraction as a last resort when ElementTree fails.
+    We know the tags exist as raw strings — this parses them directly.
+    """
+    rubrics = []
+
+    # Split on <rubric> ... </rubric> blocks
+    # Use findall to capture complete rubric blocks
+    rubric_blocks = re.findall(
+        r'<rubric>(.*?)</rubric>',
+        xml, re.DOTALL
+    )
+    print(f"   Rubrics (regex): found {len(rubric_blocks)} rubric block(s)")
+
+    for block in rubric_blocks:
+        # Title
+        t_m = re.search(r'<title>(.*?)</title>', block, re.DOTALL)
+        title = strip_html(t_m.group(1)).strip() if t_m else 'Untitled Rubric'
+
+        # Points possible
+        pp_m = re.search(r'<points_possible>(.*?)</points_possible>', block, re.DOTALL)
+        rubric_points = pp_m.group(1).strip() if pp_m else ''
+
+        # Extract criteria section
+        criteria_m = re.search(r'<criteria>(.*?)</criteria>', block, re.DOTALL)
+        criteria = []
+
+        if criteria_m:
+            # Find all criterion blocks
+            criterion_blocks = re.findall(
+                r'<criterion>(.*?)</criterion>',
+                criteria_m.group(1), re.DOTALL
+            )
+
+            for cb in criterion_blocks:
+                desc_m = re.search(r'<description>(.*?)</description>', cb, re.DOTALL)
+                long_m = re.search(r'<long_description>(.*?)</long_description>', cb, re.DOTALL)
+                pts_m  = re.search(r'<points>(.*?)</points>', cb, re.DOTALL)
+
+                crit_name = strip_html(desc_m.group(1)).strip() if desc_m else 'Unnamed'
+                crit_desc = strip_html(long_m.group(1)).strip() if long_m else ''
+                crit_pts  = pts_m.group(1).strip() if pts_m else '?'
+
+                # Extract ratings section within this criterion
+                ratings_m = re.search(r'<ratings>(.*?)</ratings>', cb, re.DOTALL)
+                ratings = []
+
+                if ratings_m:
+                    rating_blocks = re.findall(
+                        r'<rating>(.*?)</rating>',
+                        ratings_m.group(1), re.DOTALL
+                    )
+
+                    for rb in rating_blocks:
+                        r_desc_m = re.search(r'<description>(.*?)</description>', rb, re.DOTALL)
+                        r_long_m = re.search(r'<long_description>(.*?)</long_description>', rb, re.DOTALL)
+                        r_pts_m  = re.search(r'<points>(.*?)</points>', rb, re.DOTALL)
+
+                        r_name = strip_html(r_desc_m.group(1)).strip() if r_desc_m else ''
+                        r_desc = strip_html(r_long_m.group(1)).strip() if r_long_m else ''
+                        r_pts  = r_pts_m.group(1).strip() if r_pts_m else ''
+
+                        if r_name or r_desc:
+                            ratings.append({
+                                'name': r_name,
+                                'description': r_desc,
+                                'points': r_pts,
+                            })
+
+                criteria.append({
+                    'name': crit_name,
+                    'description': crit_desc,
+                    'points': crit_pts,
+                    'ratings': ratings,
+                })
+
+        rubrics.append({
+            'title': title,
+            'points': rubric_points,
+            'criteria': criteria,
+        })
+
+    total_criteria = sum(len(r['criteria']) for r in rubrics)
+    total_ratings = sum(len(c['ratings']) for r in rubrics for c in r['criteria'])
+    print(f"   Rubrics (regex): extracted {len(rubrics)} rubric(s), "
+          f"{total_criteria} criteria, {total_ratings} rating levels")
+
+    return rubrics
 
 
 # ─────────────────────────────────────────────────────────────

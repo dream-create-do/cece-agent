@@ -378,36 +378,31 @@ with st.expander("🔬 Rubric XML Diagnostic"):
     else:
         st.markdown(f"**Raw rubrics.xml:** {len(raw_rubric_xml):,} characters")
 
-        # Show what ElementTree actually sees
         import xml.etree.ElementTree as _ET
+        import re as _re
+
+        # Show first 500 chars raw
+        st.markdown("**First 500 chars of raw XML:**")
+        st.code(raw_rubric_xml[:500], language="xml")
+
+        # Strip namespaces (same as extract_rubrics does)
+        _clean = _re.sub(r'\sxmlns\s*=\s*"[^"]*"', '', raw_rubric_xml)
+        _clean = _re.sub(r'\sxmlns:\w+\s*=\s*"[^"]*"', '', _clean)
+        _clean = _re.sub(r'<(/?)(\w+):', r'<\1\2_', _clean)
+
         try:
-            _root = _ET.fromstring(raw_rubric_xml)
-            st.markdown(f"**Root tag:** `{_root.tag}`")
-            st.markdown(f"**Root attribs:** `{_root.attrib}`")
+            _root = _ET.fromstring(_clean)
+            st.markdown(f"**Root tag (after ns strip):** `{_root.tag}`")
 
-            # Show all direct children of root
-            children = list(_root)
-            st.markdown(f"**Direct children of root ({len(children)}):**")
-            for i, child in enumerate(children[:10]):
-                child_children = list(child)
-                st.markdown(f"- `<{child.tag}>` — {len(child_children)} sub-elements, attribs: `{child.attrib}`")
+            # Show ALL unique tags
+            all_tags = sorted(set(el.tag for el in _root.iter()))
+            st.markdown(f"**All unique element tags ({len(all_tags)}):**")
+            st.code(", ".join(all_tags))
 
-            # Try finding rubric at various depths
-            st.markdown("**Searching for `<rubric>` elements:**")
-            r1 = _root.findall('rubric')
-            r2 = _root.findall('.//rubric')
-            r3 = _root.findall('.//{*}rubric')  # wildcard namespace
-            st.markdown(f"- `findall('rubric')`: {len(r1)}")
-            st.markdown(f"- `findall('.//rubric')`: {len(r2)}")
-            st.markdown(f"- `findall('.//" + "{*}" + "rubric')` (wildcard ns): {len(r3)}")
-
-            # Show first 500 chars of raw XML
-            st.markdown("**First 500 chars of raw XML:**")
-            st.code(raw_rubric_xml[:500], language="xml")
-
-            # If we found rubrics with wildcard, show the namespace
-            if r3 and not r2:
-                st.warning(f"Rubrics found with namespace wildcard! First rubric tag: `{r3[0].tag}`")
+            # Count rubric-like elements
+            for search_tag in ['rubric', 'criterion', 'rating', 'criteria', 'ratings']:
+                found = _root.findall(f'.//{search_tag}')
+                st.markdown(f"- `.//{search_tag}`: **{len(found)}** element(s)")
 
         except Exception as _e:
             st.error(f"XML parse error: {_e}")
