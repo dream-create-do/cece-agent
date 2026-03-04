@@ -1,6 +1,6 @@
 """
-streamlit_app.py — CeCe Course Analysis Agent
-Web interface — deploy to Streamlit Community Cloud for a shareable URL.
+streamlit_app.py — CeCe Course Extraction Agent v5
+Web interface for extracting Canvas course content into a Course Dossier.
 """
 
 import streamlit as st
@@ -11,13 +11,12 @@ import traceback
 
 # ── Page config (must be first Streamlit call) ──────────────────
 st.set_page_config(
-    page_title="CeCe Course Analysis Agent",
+    page_title="CeCe Course Extraction Agent",
     page_icon="🎓",
     layout="centered",
-    initial_sidebar_state="expanded",
 )
 
-# ── Import the analysis engine ──────────────────────────────────
+# ── Import the extraction engine ────────────────────────────────
 try:
     from analyze import (
         read_imscc,
@@ -25,31 +24,16 @@ try:
         extract_modules,
         extract_grading_structure,
         extract_rubrics,
-        extract_learning_objectives,
-        extract_syllabus_objectives,
-        compare_objectives,
-        run_qm_precheck,
-        run_udl_precheck,
-        calculate_health_score,
-        build_analysis_document,
+        build_course_dossier,
     )
 except ImportError as e:
     st.error(f"Could not load analyze.py: {e}")
     st.stop()
 
-# ── Import the LLM analysis engine (optional) ────────────────
-LLM_AVAILABLE = False
-try:
-    from llm_analysis import run_llm_analysis, build_llm_sections
-    LLM_AVAILABLE = True
-except ImportError:
-    pass  # LLM analysis not available — anthropic package not installed
-
 
 # ── Styles ──────────────────────────────────────────────────────
 st.markdown("""
 <style>
-    /* Header accent bar */
     .header-bar {
         background: linear-gradient(135deg, #e94560, #c73652);
         border-radius: 12px;
@@ -69,8 +53,6 @@ st.markdown("""
         opacity: 0.85;
         font-size: 1rem;
     }
-
-    /* Stat cards */
     .stat-card {
         background: #f8f9ff;
         border: 1px solid #e0e4f0;
@@ -89,8 +71,6 @@ st.markdown("""
         color: #666;
         margin-top: 4px;
     }
-
-    /* Section headers */
     .section-header {
         font-size: 0.85rem;
         font-weight: 700;
@@ -99,13 +79,6 @@ st.markdown("""
         color: #888;
         margin: 1.5rem 0 0.5rem 0;
     }
-
-    /* QM badge colors */
-    .badge-pass    { background:#d4edda; color:#155724; padding:3px 10px; border-radius:20px; font-size:0.85rem; font-weight:600; }
-    .badge-review  { background:#fff3cd; color:#856404; padding:3px 10px; border-radius:20px; font-size:0.85rem; font-weight:600; }
-    .badge-redesign{ background:#f8d7da; color:#721c24; padding:3px 10px; border-radius:20px; font-size:0.85rem; font-weight:600; }
-
-    /* Download button override */
     .stDownloadButton > button {
         background: #e94560 !important;
         color: white !important;
@@ -119,8 +92,6 @@ st.markdown("""
     .stDownloadButton > button:hover {
         background: #c73652 !important;
     }
-
-    /* Hide Streamlit branding */
     footer { visibility: hidden; }
     #MainMenu { visibility: hidden; }
 </style>
@@ -131,55 +102,18 @@ st.markdown("""
 st.markdown("""
 <div class="header-bar">
     <h1>🎓 CeCe</h1>
-    <p>Course Analysis Agent &nbsp;·&nbsp; Quality Matters · UDL · Fink's Framework</p>
+    <p>Course Extraction Agent &nbsp;·&nbsp; Generates a Course Dossier for MeMe</p>
 </div>
 """, unsafe_allow_html=True)
 
 
-# ── Sidebar: LLM Analysis Settings ─────────────────────────────
-with st.sidebar:
-    st.markdown("### ⚙️ Analysis Settings")
-
-    # Check for API key in secrets
-    api_key = None
-    if LLM_AVAILABLE:
-        api_key = st.secrets.get("ANTHROPIC_API_KEY", None)
-
-    if LLM_AVAILABLE and api_key:
-        enable_llm = st.toggle(
-            "🧠 Enable AI Deep Analysis",
-            value=True,
-            help="Uses Claude (Anthropic) to evaluate each QM standard with "
-                 "genuine pedagogical reasoning. Adds ~60-90 seconds and costs "
-                 "~$0.15-0.40 per analysis.",
-        )
-        if enable_llm:
-            st.success("AI analysis enabled — API key loaded from secrets.")
-            st.caption(
-                "CeCe will make ~10 focused API calls to evaluate your course "
-                "against all 44 QM standards and UDL, then generate an executive "
-                "summary with prioritized recommendations."
-            )
-    elif LLM_AVAILABLE and not api_key:
-        enable_llm = False
-        st.warning(
-            "To enable AI deep analysis, add your Anthropic API key to "
-            "`.streamlit/secrets.toml`:\n\n"
-            '```\nANTHROPIC_API_KEY = "sk-ant-..."\n```'
-        )
-    else:
-        enable_llm = False
-        st.info(
-            "AI deep analysis requires the `anthropic` package.\n\n"
-            "`pip install anthropic`"
-        )
-
-
 # ── Intro ────────────────────────────────────────────────────────
 st.markdown("""
-Upload your Canvas course export and CeCe will analyze it against 
-**Quality Matters 7th Edition**, **UDL**, and **Fink's Significant Learning** 
-framework — producing a ready-to-use consultation document for any AI assistant.
+Upload your Canvas course export and CeCe will extract every piece of published 
+content — pages, assignments, rubrics, modules, grading structure, and more — 
+into a **Course Dossier** that MeMe uses for QM consultation.
+
+CeCe extracts. MeMe analyzes.
 """)
 
 with st.expander("ℹ️ How to export your course from Canvas"):
@@ -193,8 +127,7 @@ with st.expander("ℹ️ How to export your course from Canvas"):
     """)
 
 
-
-# ── Step 1: Course file ──────────────────────────────────────────
+# ── Step 1: Course file ─────────────────────────────────────────
 st.markdown('<p class="section-header">Step 1 — Upload your course export</p>',
             unsafe_allow_html=True)
 
@@ -209,18 +142,18 @@ if uploaded is None:
     st.info("Upload a .imscc file above to get started.")
     st.stop()
 
-# ── Step 2: Syllabus ─────────────────────────────────────────────
-st.markdown('<p class="section-header">Step 2 — Provide your syllabus</p>',
+# ── Step 2: Syllabus ────────────────────────────────────────────
+st.markdown('<p class="section-header">Step 2 — Provide your syllabus (optional but recommended)</p>',
             unsafe_allow_html=True)
 
 st.markdown(
-    "MeMe needs your syllabus to evaluate QM Standards 1, 2, and 3 accurately. "
-    "Paste the full text below, or upload a .txt file."
+    "MeMe needs your syllabus to evaluate QM Standards 1 and 2 accurately. "
+    "Paste the full text below, or upload a file."
 )
 
 syllabus_text = st.text_area(
     label="Paste syllabus text",
-    height=220,
+    height=200,
     placeholder=(
         "Paste your full syllabus here — course description, learning objectives, "
         "grading breakdown, and policies...\n\n"
@@ -264,7 +197,6 @@ if syl_file is not None:
                     pages = [page.extract_text() or "" for page in pdf.pages]
                 syllabus_text = "\n".join(pages).strip()
             except ImportError:
-                # Fallback: pypdf if pdfplumber not installed
                 import io
                 import pypdf
                 reader = pypdf.PdfReader(io.BytesIO(syl_file.read()))
@@ -277,7 +209,7 @@ if syl_file is not None:
         else:
             st.warning(
                 f"⚠️ Could not extract readable text from {syl_file.name}. "
-                "This sometimes happens with scanned PDFs or image-based documents. "
+                "This sometimes happens with scanned PDFs. "
                 "Please paste your syllabus text in the box above instead."
             )
     except Exception as e:
@@ -285,15 +217,14 @@ if syl_file is not None:
 
 if not syllabus_text or not syllabus_text.strip():
     st.warning(
-        "⚠️ No syllabus provided. MeMe will not be able to evaluate learning objectives, "
-        "policies, or CLO alignment without it. You can still run the analysis."
+        "⚠️ No syllabus provided. MeMe will request it at the start of consultation."
     )
 
-# ── Step 3: Run ──────────────────────────────────────────────────
-st.markdown('<p class="section-header">Step 3 — Analyze</p>',
+# ── Step 3: Run ─────────────────────────────────────────────────
+st.markdown('<p class="section-header">Step 3 — Extract</p>',
             unsafe_allow_html=True)
 
-run_button = st.button("▶  Run Analysis", type="primary", use_container_width=True)
+run_button = st.button("▶  Extract Course Content", type="primary", use_container_width=True)
 
 if not run_button and "last_result" not in st.session_state:
     st.stop()
@@ -303,9 +234,8 @@ file_id = f"{uploaded.name}_{uploaded.size}_{len(syllabus_text or '')}"
 
 if run_button or st.session_state.get("last_file_id") != file_id:
 
-    with st.spinner("Reading course content and running QM/UDL pre-check..."):
+    with st.spinner("Reading course content..."):
         try:
-            import sys
             from io import StringIO
             log_capture = StringIO()
             sys.stdout = log_capture
@@ -322,98 +252,49 @@ if run_button or st.session_state.get("last_file_id") != file_id:
             modules        = extract_modules(data)
             grading_groups = extract_grading_structure(data)
             rubrics        = extract_rubrics(data)
-            objectives     = extract_learning_objectives(data, modules)
-            syl_objectives = extract_syllabus_objectives(data)
-            comparison     = compare_objectives(objectives, syl_objectives)
-            qm_results     = run_qm_precheck(data, modules, grading_groups, objectives)
-            udl_results    = run_udl_precheck(data)
-            qm_counts      = calculate_health_score(qm_results)
+
+            document = build_course_dossier(
+                data, identity, modules, grading_groups, rubrics
+            )
 
             sys.stdout = sys.__stdout__
             log_output = log_capture.getvalue()
 
-            # ── LLM Deep Analysis (optional) ──
-            llm_results = None
-            llm_sections = None
-
-            if enable_llm and api_key:
-                llm_status = st.empty()
-                llm_progress = st.progress(0, text="Starting AI deep analysis...")
-
-                progress_messages = []
-                call_count = [0]
-
-                def llm_progress_callback(msg):
-                    progress_messages.append(msg)
-                    call_count[0] += 1
-                    # 10 total calls expected (8 GS + UDL + Summary)
-                    pct = min(call_count[0] / 11, 0.99)
-                    llm_progress.progress(pct, text=msg)
-
-                try:
-                    llm_results = run_llm_analysis(
-                        api_key=api_key,
-                        data=data,
-                        modules=modules,
-                        objectives=objectives,
-                        grading_groups=grading_groups,
-                        rubrics=rubrics,
-                        identity=identity,
-                        progress_callback=llm_progress_callback,
-                    )
-                    llm_sections = build_llm_sections(llm_results)
-                    llm_progress.progress(1.0, text="✅ AI analysis complete!")
-                except Exception as llm_err:
-                    llm_status.warning(f"AI analysis encountered an error: {llm_err}")
-                    log_output += f"\n\nLLM Analysis Error:\n{traceback.format_exc()}"
-
-            document = build_analysis_document(
-                            data, identity, modules, grading_groups,
-                            objectives, qm_results, udl_results,
-                            rubrics, qm_counts,
-                            syl_objectives=syl_objectives,
-                            comparison=comparison,
-                            llm_sections=llm_sections)
-
             # Cache result
-            st.session_state["last_result"]  = {
+            st.session_state["last_result"] = {
                 "document":       document,
                 "identity":       identity,
                 "modules":        modules,
                 "grading_groups": grading_groups,
-                "objectives":     objectives,
-                "qm_results":     qm_results,
-                "qm_counts":      qm_counts,
+                "rubrics":        rubrics,
                 "data":           data,
                 "log":            log_output,
                 "filename":       uploaded.name,
-                "llm_results":    llm_results,
             }
             st.session_state["last_file_id"] = file_id
 
         except Exception as e:
             sys.stdout = sys.__stdout__
-            st.error(f"Analysis failed: {e}")
+            st.error(f"Extraction failed: {e}")
             with st.expander("Error details"):
                 st.code(traceback.format_exc())
             st.stop()
 
 
-# ── Display results ──────────────────────────────────────────────
+# ── Display results ─────────────────────────────────────────────
 result = st.session_state.get("last_result")
 if not result:
     st.stop()
 
-met, partial, not_met, review_ct, recommendation = result["qm_counts"]
-identity   = result["identity"]
-modules    = result["modules"]
-objectives = result["objectives"]
-data       = result["data"]
-stats      = data.get("publish_stats", {})
+identity = result["identity"]
+modules  = result["modules"]
+rubrics  = result["rubrics"]
+data     = result["data"]
+stats    = data.get("publish_stats", {})
 
-st.success("✅ Analysis complete!")
+st.success("✅ Extraction complete!")
 
-st.markdown('<p class="section-header">Results Summary</p>', unsafe_allow_html=True)
+st.markdown('<p class="section-header">Course Summary</p>', unsafe_allow_html=True)
 
 # ── Course identity ──
 st.markdown(f"### {identity['title']} — {identity['code']}")
@@ -429,99 +310,45 @@ with col2:
                 f'{stats.get("assign_published", 0)}</div>'
                 f'<div class="stat-label">Assignments</div></div>', unsafe_allow_html=True)
 with col3:
-    st.markdown(f'<div class="stat-card"><div class="stat-number">{len(objectives)}</div>'
-                f'<div class="stat-label">Objectives</div></div>', unsafe_allow_html=True)
-with col4:
     st.markdown(f'<div class="stat-card"><div class="stat-number">'
                 f'{stats.get("wiki_published", 0)}</div>'
                 f'<div class="stat-label">Pages</div></div>', unsafe_allow_html=True)
+with col4:
+    st.markdown(f'<div class="stat-card"><div class="stat-number">'
+                f'{len(rubrics)}</div>'
+                f'<div class="stat-label">Rubrics</div></div>', unsafe_allow_html=True)
 with col5:
     st.markdown(f'<div class="stat-card"><div class="stat-number">'
-                f'{stats.get("wiki_unpublished", 0)}</div>'
-                f'<div class="stat-label">Unpublished</div></div>', unsafe_allow_html=True)
+                f'{len(data.get("lti_tools", []))}</div>'
+                f'<div class="stat-label">LTI Tools</div></div>', unsafe_allow_html=True)
 
 st.markdown("")
 
-# ── QM health score ──
-badge_class = (
-    "badge-pass"     if recommendation.startswith("PASS")     else
-    "badge-review"   if recommendation.startswith("REVIEW")   else
-    "badge-redesign"
-)
-badge_label = recommendation.split("—")[0].strip()
-badge_note  = recommendation.split("—")[1].strip() if "—" in recommendation else ""
-
-st.markdown(
-    f'**QM Recommendation:** <span class="{badge_class}">{badge_label}</span> &nbsp; {badge_note}',
-    unsafe_allow_html=True
-)
-
-# ── QM breakdown ──
-col_a, col_b, col_c, col_d = st.columns(4)
-col_a.metric("✅ Met",          met)
-col_b.metric("⚠️ Partial",      partial)
-col_c.metric("❌ Not Met",      not_met)
-col_d.metric("🔍 Needs Review", review_ct)
-
-# ── Syllabus status ──
-st.markdown("")
+# ── Status notes ──
 if data.get("syllabus_text"):
-    st.success(f"**Syllabus:** Included in the analysis ({len(data['syllabus_text']):,} characters).")
+    st.success(f"**Syllabus:** Included ({len(data['syllabus_text']):,} characters).")
 else:
-    st.warning("**Syllabus:** Not provided. MeMe will request it at the start of consultation.")
+    st.warning("**Syllabus:** Not provided. MeMe will request it during consultation.")
 
-# ── Unpublished note ──
 unpub_assign = stats.get("assign_unpublished", 0)
 unpub_pages  = stats.get("wiki_unpublished",   0)
 if unpub_assign > 0 or unpub_pages > 0:
-    st.info(f"ℹ️ **{unpub_pages} pages** and **{unpub_assign} assignments** were unpublished "
-            f"and excluded from the analysis.")
+    st.info(f"ℹ️ **{unpub_pages} page(s)** and **{unpub_assign} assignment(s)** were "
+            f"unpublished and excluded from the dossier.")
 
-# ── LLM Analysis Summary (if available) ──
-llm_results = result.get("llm_results")
-if llm_results:
-    st.markdown("")
-    st.markdown('<p class="section-header">🧠 AI Deep Analysis Results</p>',
-                unsafe_allow_html=True)
-
-    gs_results = llm_results.get("gs_results", {})
-    # Count LLM-evaluated statuses across all GS
-    llm_met = llm_partial = llm_not_met = llm_review = 0
-    for gs_num, gs_res in gs_results.items():
-        for ev in gs_res.get("evaluations", []):
-            status = ev.get("status", "")
-            if status == "Met":          llm_met += 1
-            elif status == "Partially Met": llm_partial += 1
-            elif status == "Not Met":    llm_not_met += 1
-            else:                        llm_review += 1
-
-    lcol1, lcol2, lcol3, lcol4 = st.columns(4)
-    lcol1.metric("✅ Met",          llm_met)
-    lcol2.metric("⚠️ Partial",      llm_partial)
-    lcol3.metric("❌ Not Met",      llm_not_met)
-    lcol4.metric("🔍 Review",       llm_review)
-
-    # Token usage summary
-    usage = llm_results.get("token_usage", [])
-    if usage:
-        total_in = sum(u.get("input_tokens", 0) for u in usage)
-        total_out = sum(u.get("output_tokens", 0) for u in usage)
-        st.caption(f"Analysis used {total_in:,} input + {total_out:,} output tokens across {len(usage)} API calls.")
-
-    if llm_results.get("errors"):
-        for err in llm_results["errors"]:
-            st.warning(f"⚠️ {err}")
-
+if not rubrics:
+    st.warning("⚠️ **No rubrics found** in the export. This is a significant gap for "
+               "QM Standard 3.3. MeMe will flag this during consultation.")
 
 # ── Download ─────────────────────────────────────────────────────
-st.markdown('<p class="section-header">Step 3 — Download & consult</p>',
+st.markdown('<p class="section-header">Step 4 — Download & consult with MeMe</p>',
             unsafe_allow_html=True)
 
-base_name    = os.path.splitext(result["filename"])[0]
-download_name = f"{base_name}_analysis.md"
+base_name     = os.path.splitext(result["filename"])[0]
+download_name = f"{base_name}_dossier.md"
 
 st.download_button(
-    label="⬇  Download Analysis Document (.md)",
+    label="⬇  Download Course Dossier (.md)",
     data=result["document"].encode("utf-8"),
     file_name=download_name,
     mime="text/markdown",
@@ -532,22 +359,22 @@ st.markdown("""
 **After downloading:**
 1. Open the `.md` file in any text editor
 2. Select all (Ctrl+A / Cmd+A) and copy
-3. Paste into [Claude.ai](https://claude.ai), ChatGPT, or your preferred AI assistant
-4. The CeCe consultation prompt is at the bottom of the document
+3. Paste into your MeMe consultation (Claude, ChatGPT, or Gemini)
+4. MeMe will conduct a full QM needs analysis and guide you through remediation
 """)
 
 
-# ── Preview ──────────────────────────────────────────────────────
-with st.expander("🔍 Preview the analysis document"):
+# ── Preview ─────────────────────────────────────────────────────
+with st.expander("🔍 Preview the course dossier"):
     st.markdown(result["document"][:8000] + "\n\n*[truncated for preview — download for full document]*")
 
-with st.expander("📋 Analysis log"):
+with st.expander("📋 Extraction log"):
     st.code(result["log"], language=None)
 
 
-# ── Footer ───────────────────────────────────────────────────────
+# ── Footer ──────────────────────────────────────────────────────
 st.markdown("---")
 st.caption(
-    "CeCe Course Analysis Agent · Built on Fink's Significant Learning, "
-    "Quality Matters 7th Edition, and UDL · Developed for TOPkit / Florida SUS"
+    "CeCe Course Extraction Agent v5 · Part of the CeCe / MeMe / DeDe "
+    "Instructional Design Suite · Developed for TOPkit / Florida SUS"
 )
