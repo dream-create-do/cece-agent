@@ -371,6 +371,44 @@ with st.expander("🔍 Preview the course dossier"):
 with st.expander("📋 Extraction log"):
     st.code(result["log"], language=None)
 
+with st.expander("🔬 Rubric XML Diagnostic"):
+    raw_rubric_xml = data.get("rubrics", "")
+    if not raw_rubric_xml:
+        st.warning("No `course_settings/rubrics.xml` found in the IMSCC export.")
+    else:
+        st.markdown(f"**Raw rubrics.xml:** {len(raw_rubric_xml):,} characters")
+
+        # Show unique XML tags
+        import re as _re
+        tags = sorted(set(_re.findall(r'<(/?\w+[\w:]*)', raw_rubric_xml)))
+        st.markdown(f"**Unique XML tags found ({len(tags)}):**")
+        tag_lines = []
+        for t in tags:
+            count = raw_rubric_xml.count(f'<{t}')
+            tag_lines.append(f"`<{t}>` — {count} occurrence(s)")
+        st.markdown("  \n".join(tag_lines))
+
+        # Show first rubric block structure
+        blocks = _re.split(r'<rubric\s+identifier=[^>]+>', raw_rubric_xml)
+        if len(blocks) > 1:
+            st.markdown(f"**Rubric blocks found:** {len(blocks) - 1}")
+            st.markdown("**First rubric block (raw XML):**")
+            st.code(blocks[1][:5000], language="xml")
+        else:
+            # Try alternate split
+            blocks2 = _re.split(r'<rubric[\s>]', raw_rubric_xml)
+            if len(blocks2) > 1:
+                st.markdown(f"**Rubric blocks found (alternate split):** {len(blocks2) - 1}")
+                st.markdown("**First rubric block (raw XML):**")
+                st.code(blocks2[1][:5000], language="xml")
+            else:
+                st.warning("Could not split into rubric blocks. Showing raw XML:")
+                st.code(raw_rubric_xml[:8000], language="xml")
+
+        st.markdown("---")
+        st.markdown("**Full raw XML** (first 15,000 chars):")
+        st.code(raw_rubric_xml[:15000], language="xml")
+
 
 # ── Footer ──────────────────────────────────────────────────────
 st.markdown("---")
