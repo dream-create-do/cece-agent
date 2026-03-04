@@ -503,57 +503,101 @@ def extract_grading_structure(data):
 
 def extract_rubrics(data):
     """
-    Deep rubric extraction: captures every criterion, every rating level,
-    every description, and every point value. This gives MeMe the full
-    picture needed to evaluate QM Standard 3.3.
+    Deep rubric extraction from Canvas rubrics.xml.
+
+    Canvas XML structure (confirmed from live export):
+      <rubrics>
+        <rubric>
+          <title>...</title>
+          <points_possible>...</points_possible>
+          <criteria>
+            <criterion>
+              <description>Criterion Name</description>
+              <long_description>Detailed description</long_description>
+              <points>20.0</points>
+              <criterion_use_range>false</criterion_use_range>
+              <ratings>
+                <rating>
+                  <description>Rating Level Name</description>
+                  <long_description>What this level looks like</long_description>
+                  <points>20.0</points>
+                  <id>...</id>
+                </rating>
+                ...
+              </ratings>
+            </criterion>
+            ...
+          </criteria>
+        </rubric>
+        ...
+      </rubrics>
     """
     rubrics = []
     xml = data.get('rubrics', '')
     if not xml:
         return rubrics
 
-    for block in re.split(r'<rubric\s+identifier=[^>]+>', xml)[1:]:
-        t_m   = re.search(r'<title>(.+?)</title>', block, re.DOTALL)
+    # Split on <rubric> tags (Canvas uses simple tags, no attributes)
+    rubric_blocks = re.split(r'<rubric>(?!\w)', xml)
+
+    for block in rubric_blocks[1:]:  # skip preamble before first <rubric>
+        # Rubric title
+        t_m = re.search(r'<title>(.*?)</title>', block, re.DOTALL)
         title = strip_html(t_m.group(1)).strip() if t_m else 'Untitled Rubric'
 
-        # Total rubric points
-        rub_pts_m = re.search(r'<points_possible>(.+?)</points_possible>', block, re.DOTALL)
-        rubric_points = rub_pts_m.group(1).strip() if rub_pts_m else ''
+        # Total points
+        pp_m = re.search(r'<points_possible>(.*?)</points_possible>', block, re.DOTALL)
+        rubric_points = pp_m.group(1).strip() if pp_m else ''
 
+        # Extract the <criteria>...</criteria> section
+        criteria_section = re.search(r'<criteria>(.*?)</criteria>', block, re.DOTALL)
         criteria = []
-        for cb in re.split(r'<criterion\s+identifier=[^>]+>', block)[1:]:
-            desc_m = re.search(r'<description>(.+?)</description>', cb, re.DOTALL)
-            long_m = re.search(r'<long_description>(.+?)</long_description>', cb, re.DOTALL)
-            pts_m  = re.search(r'<points>(.+?)</points>', cb, re.DOTALL)
 
-            criterion_name = strip_html(desc_m.group(1)).strip() if desc_m else 'Unnamed'
-            criterion_desc = strip_html(long_m.group(1)).strip() if long_m else ''
-            criterion_pts  = pts_m.group(1).strip() if pts_m else '?'
+        if criteria_section:
+            # Split into individual <criterion> blocks
+            criterion_blocks = re.split(r'<criterion>(?!\w)', criteria_section.group(1))
 
-            # Extract rating levels within this criterion
-            ratings = []
-            for rb in re.split(r'<rating\s+identifier=[^>]+>', cb)[1:]:
-                r_desc_m = re.search(r'<description>(.+?)</description>', rb, re.DOTALL)
-                r_long_m = re.search(r'<long_description>(.+?)</long_description>', rb, re.DOTALL)
-                r_pts_m  = re.search(r'<points>(.+?)</points>', rb, re.DOTALL)
+            for cb in criterion_blocks[1:]:  # skip preamble
+                # Criterion description (this is the criterion NAME in Canvas)
+                desc_m = re.search(r'<description>(.*?)</description>', cb, re.DOTALL)
+                long_m = re.search(r'<long_description>(.*?)</long_description>', cb, re.DOTALL)
+                pts_m  = re.search(r'<points>(.*?)</points>', cb, re.DOTALL)
+                cid_m  = re.search(r'<criterion_id>(.*?)</criterion_id>', cb, re.DOTALL)
 
-                rating_name = strip_html(r_desc_m.group(1)).strip() if r_desc_m else ''
-                rating_desc = strip_html(r_long_m.group(1)).strip() if r_long_m else ''
-                rating_pts  = r_pts_m.group(1).strip() if r_pts_m else ''
+                criterion_name = strip_html(desc_m.group(1)).strip() if desc_m else 'Unnamed'
+                criterion_desc = strip_html(long_m.group(1)).strip() if long_m else ''
+                criterion_pts  = pts_m.group(1).strip() if pts_m else '?'
 
-                if rating_name or rating_desc:
-                    ratings.append({
-                        'name': rating_name,
-                        'description': rating_desc,
-                        'points': rating_pts,
-                    })
+                # Extract <ratings>...</ratings> section within this criterion
+                ratings_section = re.search(r'<ratings>(.*?)</ratings>', cb, re.DOTALL)
+                ratings = []
 
-            criteria.append({
-                'name': criterion_name,
-                'description': criterion_desc,
-                'points': criterion_pts,
-                'ratings': ratings,
-            })
+                if ratings_section:
+                    # Split into individual <rating> blocks
+                    rating_blocks = re.split(r'<rating>(?!\w)', ratings_section.group(1))
+
+                    for rb in rating_blocks[1:]:  # skip preamble
+                        r_desc_m = re.search(r'<description>(.*?)</description>', rb, re.DOTALL)
+                        r_long_m = re.search(r'<long_description>(.*?)</long_description>', rb, re.DOTALL)
+                        r_pts_m  = re.search(r'<points>(.*?)</points>', rb, re.DOTALL)
+
+                        rating_name = strip_html(r_desc_m.group(1)).strip() if r_desc_m else ''
+                        rating_desc = strip_html(r_long_m.group(1)).strip() if r_long_m else ''
+                        rating_pts  = r_pts_m.group(1).strip() if r_pts_m else ''
+
+                        if rating_name or rating_desc:
+                            ratings.append({
+                                'name': rating_name,
+                                'description': rating_desc,
+                                'points': rating_pts,
+                            })
+
+                criteria.append({
+                    'name': criterion_name,
+                    'description': criterion_desc,
+                    'points': criterion_pts,
+                    'ratings': ratings,
+                })
 
         rubrics.append({
             'title': title,
