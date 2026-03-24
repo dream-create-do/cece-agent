@@ -1,8 +1,11 @@
 """
-analyze.py — CeCe Course DNA Extraction Agent v6.0
+analyze.py — CeCe Course DNA Extraction Agent v6.1
 ====================================================
 CeCe reads Canvas IMSCC exports and extracts the complete course DNA
 into a Course DNA Document for MeMe's QM consultation.
+
+v6.1: Preserves HTML metadata (headings, links, images/alt text,
+accessibility flags) in Sections 6 and 11 for MeMe's GS 7.x and 8.x evaluation.
 
 CeCe extracts. She does not evaluate or judge. That's MeMe's job.
 """
@@ -46,6 +49,113 @@ def strip_html(html_content):
                           ('&gt;','>'),('&quot;','"'),('&#39;',"'")]:
         text = text.replace(entity, char)
     return re.sub(r'\s+', ' ', text).strip()
+
+
+def extract_html_metadata(raw_html):
+    """
+    Extract structured metadata from raw HTML that MeMe needs for QM evaluation.
+    Returns a dict with headings, links, images, and accessibility observations.
+    """
+    meta = {
+        'headings': [],   # [(level, text)]
+        'links': [],      # [(text, url)]
+        'images': [],     # [(alt_text, src_snippet)]
+        'has_tables': False,
+        'accessibility_notes': [],
+    }
+
+    if not raw_html:
+        return meta
+
+    # Extract headings with level
+    for m in re.finditer(r'<h([1-6])[^>]*>(.*?)</h\1>', raw_html, re.DOTALL | re.IGNORECASE):
+        level = int(m.group(1))
+        text = strip_html(m.group(2)).strip()
+        if text:
+            meta['headings'].append((level, text))
+
+    # Extract links with URL and display text
+    for m in re.finditer(r'<a\s[^>]*href=["\']([^"\']+)["\'][^>]*>(.*?)</a>', raw_html, re.DOTALL | re.IGNORECASE):
+        url = m.group(1).strip()
+        text = strip_html(m.group(2)).strip()
+        if url and not url.startswith('#') and not url.startswith('javascript:'):
+            display = text if text else '[no link text]'
+            meta['links'].append((display, url))
+
+    # Extract images with alt text
+    for m in re.finditer(r'<img\s[^>]*?(?:alt=["\']([^"\']*)["\'])?[^>]*?(?:src=["\']([^"\']+)["\'])?[^>]*?/?>', raw_html, re.IGNORECASE):
+        alt = m.group(1) if m.group(1) is not None else None
+        src = m.group(2) or ''
+        # Also try reverse order (src before alt)
+        if alt is None:
+            alt_m = re.search(r'alt=["\']([^"\']*)["\']', m.group(0), re.IGNORECASE)
+            alt = alt_m.group(1) if alt_m else None
+        src_snippet = src.split('/')[-1][:40] if src else '[unknown]'
+
+        if alt is None:
+            meta['images'].append(('[MISSING ALT TEXT]', src_snippet))
+            meta['accessibility_notes'].append(f'Image missing alt text: {src_snippet}')
+        elif alt.strip() == '':
+            meta['images'].append(('[decorative — empty alt]', src_snippet))
+        else:
+            meta['images'].append((alt.strip(), src_snippet))
+
+    # Check for tables
+    if '<table' in raw_html.lower():
+        meta['has_tables'] = True
+
+    # Check heading hierarchy
+    if meta['headings']:
+        levels = [h[0] for h in meta['headings']]
+        for i in range(1, len(levels)):
+            if levels[i] > levels[i-1] + 1:
+                meta['accessibility_notes'].append(
+                    f'Heading level skipped: h{levels[i-1]} → h{levels[i]} ("{meta["headings"][i][1][:30]}")')
+
+    # Check for non-descriptive link text
+    bad_link_texts = {'click here', 'here', 'link', 'read more', 'more', 'this'}
+    for text, url in meta['links']:
+        if text.lower().strip() in bad_link_texts:
+            meta['accessibility_notes'].append(f'Non-descriptive link text: "{text}" → {url[:60]}')
+
+    return meta
+
+
+def format_metadata_block(meta):
+    """Format extracted metadata into a readable markdown block for the DNA document."""
+    lines = []
+
+    if meta['headings']:
+        lines.append('**Heading Structure:**')
+        for level, text in meta['headings']:
+            indent = '  ' * (level - 1)
+            lines.append(f'{indent}- h{level}: {text}')
+        lines.append('')
+
+    if meta['links']:
+        lines.append(f'**Links ({len(meta["links"])}):**')
+        for text, url in meta['links']:
+            url_short = url[:80] + ('...' if len(url) > 80 else '')
+            lines.append(f'- [{text}]({url_short})')
+        lines.append('')
+
+    if meta['images']:
+        lines.append(f'**Images ({len(meta["images"])}):**')
+        for alt, src in meta['images']:
+            lines.append(f'- Alt: "{alt}" — {src}')
+        lines.append('')
+
+    if meta['has_tables']:
+        lines.append('**Contains tables:** Yes')
+        lines.append('')
+
+    if meta['accessibility_notes']:
+        lines.append('**⚠️ Accessibility Flags:**')
+        for note in meta['accessibility_notes']:
+            lines.append(f'- {note}')
+        lines.append('')
+
+    return '\n'.join(lines) if lines else ''
 
 
 def is_media_page(page_name):
@@ -122,7 +232,8 @@ def read_imscc(file_path, file_bytes=None, syllabus_text=''):
         'module_meta':        '',
         'rubrics':            '',
         'manifest':           '',
-        'wiki_full':          {},
+        'wiki_full':          {},    # page_name → plain text
+        'wiki_raw':           {},    # page_name → raw HTML (for metadata extraction)
         'wiki_titles':        [],
         'wiki_unpublished':   [],
         'assignments':        {},
@@ -213,6 +324,7 @@ def read_imscc(file_path, file_bytes=None, syllabus_text=''):
                     clean = strip_html(raw).strip()
                     if clean:
                         data['wiki_full'][page_name] = clean
+                        data['wiki_raw'][page_name] = raw
                 except Exception:
                     data['wiki_full'][page_name] = '[could not read]'
 
@@ -263,6 +375,7 @@ def read_imscc(file_path, file_bytes=None, syllabus_text=''):
                     data['assignments'][clean_name] = {
                         'instructions': instructions, 'due_date': due_date,
                         'points': points, 'sub_type': sub_type, 'folder_id': folder_id,
+                        'instructions_raw': raw_html,
                     }
             except Exception:
                 pass
@@ -595,8 +708,15 @@ def build_course_dna(data, identity, modules, grading_groups, rubrics):
     else:
         for name, det in data['assignments'].items():
             L += [f'### {name}', '',
-                f'**Points:** {det["points"]} | **Due:** {det["due_date"]} | **Submission:** {det["sub_type"]}', '',
-                '**Instructions:**', det['instructions'], '', '---', '']
+                f'**Points:** {det["points"]} | **Due:** {det["due_date"]} | **Submission:** {det["sub_type"]}', '']
+            # Add metadata block if raw HTML is available
+            raw_html = det.get('instructions_raw', '')
+            if raw_html:
+                meta = extract_html_metadata(raw_html)
+                meta_block = format_metadata_block(meta)
+                if meta_block:
+                    L += [meta_block]
+            L += ['**Instructions:**', det['instructions'], '', '---', '']
     L += ['---']
 
     # Section 7: Assessments
@@ -651,9 +771,19 @@ def build_course_dna(data, identity, modules, grading_groups, rubrics):
     L += ['', '---']
 
     # Section 11: Full Page Content
-    L += ['', '## SECTION 11: COURSE PAGE CONTENT', '']
+    L += ['', '## SECTION 11: COURSE PAGE CONTENT',
+        '> Each page includes an HTML metadata block (headings, links, images, accessibility flags)',
+        '> followed by the plain text content. MeMe uses metadata for QM 7.x and 8.x evaluation.', '']
     for page_name, content in data['wiki_full'].items():
-        L += [f'### {page_name}', '', content, '', '---', '']
+        L += [f'### {page_name}', '']
+        # Add metadata block if raw HTML is available
+        raw_html = data.get('wiki_raw', {}).get(page_name, '')
+        if raw_html:
+            meta = extract_html_metadata(raw_html)
+            meta_block = format_metadata_block(meta)
+            if meta_block:
+                L += [meta_block]
+        L += ['**Page Content:**', '', content, '', '---', '']
     L += ['---']
 
     # Section 12: Notes for MeMe
@@ -672,6 +802,38 @@ def build_course_dna(data, identity, modules, grading_groups, rubrics):
     up = stats.get('assign_unpublished', 0) + stats.get('wiki_unpublished', 0)
     if up > 0:
         notes.append(f'{up} item(s) were unpublished and excluded.')
+
+    # Aggregate accessibility flags from all pages
+    all_a11y_flags = []
+    total_images = 0
+    missing_alt = 0
+    total_links = 0
+    bad_link_text = 0
+    heading_skips = 0
+
+    for page_name in data.get('wiki_raw', {}):
+        meta = extract_html_metadata(data['wiki_raw'][page_name])
+        total_images += len(meta['images'])
+        missing_alt += sum(1 for alt, _ in meta['images'] if 'MISSING' in alt)
+        total_links += len(meta['links'])
+        bad_link_text += sum(1 for n in meta['accessibility_notes'] if 'Non-descriptive link' in n)
+        heading_skips += sum(1 for n in meta['accessibility_notes'] if 'Heading level skipped' in n)
+
+    for det in data['assignments'].values():
+        raw = det.get('instructions_raw', '')
+        if raw:
+            meta = extract_html_metadata(raw)
+            total_images += len(meta['images'])
+            missing_alt += sum(1 for alt, _ in meta['images'] if 'MISSING' in alt)
+
+    notes.append(f'HTML metadata extracted for {len(data.get("wiki_raw", {}))} pages and {len(data["assignments"])} assignments.')
+    if total_images > 0:
+        notes.append(f'Images: {total_images} total, {missing_alt} missing alt text (QM 8.4).')
+    if bad_link_text > 0:
+        notes.append(f'Non-descriptive link text found {bad_link_text} time(s) (QM 8.3).')
+    if heading_skips > 0:
+        notes.append(f'Heading hierarchy skipped {heading_skips} time(s) (QM 8.2).')
+
     for note in notes:
         L.append(f'- {note}')
     L += ['', '---']
@@ -679,7 +841,7 @@ def build_course_dna(data, identity, modules, grading_groups, rubrics):
     # Appendix: QM Reference
     L += ['', '## APPENDIX: QM 7TH EDITION RUBRIC REFERENCE', '']
     L += _qm_reference_appendix()
-    L += ['', '---', f'*CeCe Course DNA Document v6.0 — Generated {today}*']
+    L += ['', '---', f'*CeCe Course DNA Document v6.1 — Generated {today}*']
 
     return '\n'.join(L)
 
@@ -763,7 +925,7 @@ def _qm_reference_appendix():
 
 def main():
     print('\n' + '='*60)
-    print('  CeCe Course DNA Extraction Agent v6')
+    print('  CeCe Course DNA Extraction Agent v6.1')
     print('='*60)
     if len(sys.argv) < 2:
         print('\nUsage:  python analyze.py your-course.imscc')

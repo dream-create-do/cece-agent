@@ -395,5 +395,5 @@ with st.expander("🔬 Rubric XML diagnostic"):
 # ── Footer ──────────────────────────────────────────────────────
 st.markdown("---")
 st.caption(
-    "CeCe v6 · Course DNA Extraction Agent · CeCe / MeMe / DeDe Suite · TOPkit / Florida SUS"
+    "CeCe v6.1 · Course DNA Extraction Agent · CeCe / MeMe / DeDe Suite · TOPkit / Florida SUS"
 )
